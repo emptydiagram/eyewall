@@ -14,8 +14,9 @@ impl BskyPostId {
 }
 
 struct BskyPostGraphData {
-    ro_root: Option<BskyPostId>,
-    qo_root: Option<BskyPostId>,
+    ro_sid: Option<SubgraphId>,
+    qo_sid: Option<SubgraphId>,
+    rq_sid: Option<SubgraphId>,
     ro_depth: u32,
     qo_depth: u32,
     // with the reply-quote graph, there isn't a well-defined depth, so we
@@ -29,8 +30,9 @@ struct BskyPostGraphData {
 impl BskyPostGraphData {
     fn new_root() -> BskyPostGraphData {
         BskyPostGraphData {
-            ro_root: None,
-            qo_root: None,
+            ro_sid: None,
+            qo_sid: None,
+            rq_sid: None,
             ro_depth: 1,
             qo_depth: 1,
             rq_max_depth: 1,
@@ -143,51 +145,30 @@ impl BskyGraphData {
             let rq_max_depth = parent_data.rq_max_depth + 1;
             let parent_was_ro_leaf = parent_data.is_ro_leaf;
             let parent_was_rq_leaf = parent_data.is_rq_leaf;
-            let parent_qo_root_maybe = parent_data.qo_root.as_ref().map(|qr| qr.clone());
             parent_data.is_ro_leaf = false;
             parent_data.is_rq_leaf = false;
-            let tree_data = BskyPostGraphData {
-                ro_root: Some(reply_to.root.clone()),
-                qo_root: None,
-                ro_depth: ro_depth,
-                qo_depth: 1,
-                rq_max_depth: rq_max_depth,
-                is_ro_leaf: true,
-                is_qo_leaf: true,
-                is_rq_leaf: true
-            };
+
+            let ro_sid: SubgraphId;
 
             // parent is a reply root iff ro_root is None. we defer creating a subgraph until we have a parent/child
             // relationship, so we have to create it here
-            let mut ro_sid_maybe = None;
-            if parent_data.ro_root.is_none() && !self.source_subgraphs.contains_key(&reply_to.target) {
+            // if parent_data.ro_sid.is_none() && !self.source_subgraphs.contains_key(&reply_to.target) {
+            if parent_data.ro_sid.is_none() {
+                if self.source_subgraphs.contains_key(&reply_to.target) {
+                    panic!("source_subgraphs unexpectedly contains entry");
+                }
                 let post_ids = vec![reply_to.target.clone()];
-                let sid = self.make_subgraph( &mut post_ids.into_iter(), SubgraphType::Reply);
-                ro_sid_maybe = Some(sid);
+                ro_sid = self.make_subgraph( &mut post_ids.into_iter(), SubgraphType::Reply);
+                parent_data.ro_sid = Some(ro_sid);
                 // don't insert RQ subgraph yet. only do it if it's actually different from the R subgraph,
                 // which happens if some post in the R subgraph gets quoted
+            } else {
+                ro_sid = parent_data.ro_sid.unwrap();
             }
 
             // if we replied to a post in quote subgraph. and the corresponding RQ graph doesnt exist
 
-            let mut rq_sid_maybe = None;
-            let parent_qo_root_maybe = {
-                if parent_qo_root_maybe.is_some() {
-                    parent_qo_root_maybe.as_ref()
-                } else {
-                    match self.source_subgraphs.get(&reply_to.target) {
-                        None => None,
-                        Some(infos) => {
-                            if infos.iter().any(|si| si.ty == SubgraphType::Quote) {
-                                Some(&reply_to.target)
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                }
-            };
-            if let Some(parent_qo_root) = parent_qo_root_maybe {
+            if let Some(parent_qo_sid) = parent_data.qo_sid {
                 let source = match self.posts.get(&parent_qo_root).expect("Expected parent qo root").ro_root {
                     Some(ref pqr_ro_root) => pqr_ro_root,
                     None => parent_qo_root,
@@ -201,6 +182,18 @@ impl BskyGraphData {
                     rq_sid_maybe = Some(sid);
                 }
             }
+
+            let tree_data = BskyPostGraphData {
+                ro_sid: Some(ro_sid),
+                qo_sid: None,
+                rq_sid: None,
+                ro_depth: ro_depth,
+                qo_depth: 1,
+                rq_max_depth: rq_max_depth,
+                is_ro_leaf: true,
+                is_qo_leaf: true,
+                is_rq_leaf: true
+            };
 
             self.posts.insert(record.id.clone(), tree_data);
 
