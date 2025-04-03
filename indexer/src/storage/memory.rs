@@ -194,6 +194,7 @@ impl BskyGraphData {
                 ro_sg_stats.max_width += 1;
             }
 
+            // TODO: reply-quote subgraph
 
         } else if record.reply_to.is_none() {
             let target = record.quote_of.as_ref().unwrap();
@@ -201,28 +202,80 @@ impl BskyGraphData {
                 self.pending.insert(record.clone());
                 return;
             }
-            if !self.posts.contains_key(&record.id) {
-                let source2 = record.id.clone();
-                let parent_data = self.posts.get_mut(target).unwrap();
-
-                // TODO
-                // let qo_depth = parent_data.qo_depth + 1;
-                // let parent_was_qo_leaf = parent_data.is_qo_leaf;
-                // parent_data.is_qo_leaf = false;
-
-                // let tree_data = BskyPostTreeData {
-                //     ro_root: None,
-                //     qo_root: Some(root.clone()),
-                //     ro_depth: 1,
-                //     qo_depth: qo_depth,
-                //     is_ro_leaf: true,
-                //     is_qo_leaf: true,
-                // };
-
-                // self.posts.insert(source2, tree_data);
-
-                panic!("TODO");
+            if self.posts.contains_key(&record.id) {
+                return;
             }
+
+            // not pending, didn't process yet
+
+            let parent_data = self.posts.get_mut(target).unwrap();
+            let parent_is_root = parent_data.qo_root.is_none();
+            let qo_root = if parent_is_root {
+                target.clone()
+            } else {
+                parent_data.qo_root.as_ref().expect("Expected quote parent to have root").clone()
+            };
+            let qo_depth = parent_data.qo_depth + 1;
+            let rq_max_depth = parent_data.rq_max_depth + 1;
+            let parent_was_qo_leaf = parent_data.is_qo_leaf;
+            let parent_was_rq_leaf = parent_data.is_rq_leaf;
+            parent_data.is_qo_leaf = false;
+            parent_data.is_rq_leaf = false;
+            let tree_data = BskyPostGraphData {
+                ro_root: None,
+                qo_root: Some(qo_root.clone()),
+                ro_depth: 1,
+                qo_depth: qo_depth,
+                rq_max_depth: rq_max_depth,
+                is_ro_leaf: true,
+                is_qo_leaf: true,
+                is_rq_leaf: true
+            };
+
+            // parent is a quote root iff qo_root is None. we defer creating a subgraph until we have a parent/child
+            // relationship, so we have to create it here
+            let mut qo_sid_maybe = None;
+            if parent_is_root && !self.source_subgraphs.contains_key(&target) {
+                let sid = self.make_subgraph(target.clone(), SubgraphType::Quote);
+                qo_sid_maybe = Some(sid);
+                // don't insert RQ subgraph yet. only do it if it's actually different from the R subgraph,
+                // which happens if some post in the Q subgraph gets a reply
+            }
+
+            self.posts.insert(record.id.clone(), tree_data);
+
+            // the new post we just inserted is part of at most two subgraphs:
+            //  - quote subgraph
+            //  - reply-quote subgraph
+            // find each of these, if they exist, and update the appropriate stats
+
+            if qo_sid_maybe.is_none() {
+                // if we're here, it's a reply to a non-reply-root post, so the subgraph already exists
+                let root_subgraphs = self.source_subgraphs
+                    .get(&qo_root)
+                    .expect("Expected quote root to have subgraph");
+                for sg in root_subgraphs {
+                    if sg.ty == SubgraphType::Quote {
+                        qo_sid_maybe = Some(sg.id);
+                        break;
+                    }
+                }
+            }
+
+            let qo_sid = qo_sid_maybe.expect("Expected reply subgraph to exist for reply");
+
+            let qo_sg_stats = self.subgraph_stats
+                .get_mut(&qo_sid)
+                .expect("Expected quote subgraph stats to exist for reply");
+
+            qo_sg_stats.size += 1;
+            qo_sg_stats.max_depth = qo_sg_stats.max_depth.max(qo_depth);
+            if !parent_was_qo_leaf {
+                qo_sg_stats.max_width += 1;
+            }
+
+            // TODO: reply-quote subgraph
+
         } else {
             panic!("TODO");
         }
@@ -275,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_thread() {
+    fn test_simple_reply_thread() {
         let mut data = BskyGraphData::new();
 
         let id1 = BskyPostId::from("a", "1");
@@ -338,6 +391,79 @@ mod tests {
         assert_eq!(sub_infos.len(), 1);
         let sub_info = sub_infos[0];
         assert_eq!(sub_info.ty, SubgraphType::Reply);
+        let sid = sub_info.id;
+        let stats_maybe = data.subgraph_stats.get(&sid);
+        assert!(stats_maybe.is_some());
+        let stats = stats_maybe.unwrap();
+        assert_eq!(stats.size, 3);
+        assert_eq!(stats.max_width, 1);
+        assert_eq!(stats.max_depth, 3);
+    }
+
+    #[test]
+    fn test_simple_quote_thread() {
+        let mut data = BskyGraphData::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "2");
+        let id3 = BskyPostId::from("a", "2");
+        data.ingest_record(BskyPostRecord { id: id1.clone(), reply_to: None, quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id2.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+        data.ingest_record(BskyPostRecord { id: id3.clone(), reply_to: None, quote_of: Some(id2.clone()) });
+
+        assert_eq!(data.posts.len(), 3);
+        assert_eq!(data.pending.len(), 0);
+        assert_eq!(data.subgraph_stats.len(), 1);
+        assert_eq!(data.source_subgraphs.len(), 1);
+
+        let post1 = data.posts.get(&id1);
+        assert!(post1.is_some());
+        let post = post1.unwrap();
+        assert!(post.ro_root.is_none());
+        assert!(post.qo_root.is_none());
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 1);
+        assert!(post.is_ro_leaf);
+        assert!(!post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
+
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_root.is_none());
+        assert!(post.qo_root.is_some());
+        let post_qo_root = post.qo_root.as_ref().unwrap();
+        assert_eq!(&post_qo_root.did, &id1.did);
+        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(!post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
+
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_root.is_none());
+        assert!(post.qo_root.is_some());
+        let post_qo_root = post.qo_root.as_ref().unwrap();
+        assert_eq!(&post_qo_root.did, &id1.did);
+        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 3);
+        assert_eq!(post.rq_max_depth, 3);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sub_infos_maybe = data.source_subgraphs.get(&id1);
+        assert!(sub_infos_maybe.is_some());
+        let sub_infos = sub_infos_maybe.unwrap();
+        assert_eq!(sub_infos.len(), 1);
+        let sub_info = sub_infos[0];
+        assert_eq!(sub_info.ty, SubgraphType::Quote);
         let sid = sub_info.id;
         let stats_maybe = data.subgraph_stats.get(&sid);
         assert!(stats_maybe.is_some());
@@ -426,6 +552,84 @@ mod tests {
     }
 
     #[test]
+    fn test_3_root_quotes() {
+        let mut data = BskyGraphData::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "2");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("c", "1");
+        data.ingest_record(BskyPostRecord { id: id1.clone(), reply_to: None, quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id2.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+        data.ingest_record(BskyPostRecord { id: id3.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+        data.ingest_record(BskyPostRecord { id: id4.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+
+        assert_eq!(data.posts.len(), 4);
+        assert_eq!(data.pending.len(), 0);
+        assert_eq!(data.subgraph_stats.len(), 1);
+        assert_eq!(data.source_subgraphs.len(), 1);
+
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_root.is_none());
+        assert!(post.qo_root.is_some());
+        let post_qo_root = post.qo_root.as_ref().unwrap();
+        assert_eq!(&post_qo_root.did, &id1.did);
+        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_root.is_none());
+        assert!(post.qo_root.is_some());
+        let post_qo_root = post.qo_root.as_ref().unwrap();
+        assert_eq!(&post_qo_root.did, &id1.did);
+        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let post4 = data.posts.get(&id4);
+        assert!(post4.is_some());
+        let post = post4.unwrap();
+        assert!(post.ro_root.is_none());
+        assert!(post.qo_root.is_some());
+        let post_qo_root = post.qo_root.as_ref().unwrap();
+        assert_eq!(&post_qo_root.did, &id1.did);
+        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sub_infos_maybe = data.source_subgraphs.get(&id1);
+        assert!(sub_infos_maybe.is_some());
+        let sub_infos = sub_infos_maybe.unwrap();
+        assert_eq!(sub_infos.len(), 1);
+        let sub_info = sub_infos[0];
+        assert_eq!(sub_info.ty, SubgraphType::Quote);
+        let sid = sub_info.id;
+        let stats_maybe = data.subgraph_stats.get(&sid);
+        assert!(stats_maybe.is_some());
+        let stats = stats_maybe.unwrap();
+        assert_eq!(stats.size, 4);
+        assert_eq!(stats.max_width, 3);
+        assert_eq!(stats.max_depth, 2);
+    }
+
+    #[test]
     fn test_3_non_root_replies() {
         let mut data = BskyGraphData::new();
 
@@ -469,6 +673,56 @@ mod tests {
         assert!(post.qo_root.is_none());
         assert_eq!(post.ro_depth, 3);
         assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 3);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+    }
+
+    #[test]
+    fn test_3_non_root_quotes() {
+        let mut data = BskyGraphData::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("b", "2");
+        let id5 = BskyPostId::from("c", "1");
+        data.ingest_record(BskyPostRecord { id: id1.clone(), reply_to: None, quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id2.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+        data.ingest_record(BskyPostRecord { id: id3.clone(), reply_to: None, quote_of: Some(id2.clone()) });
+        data.ingest_record(BskyPostRecord { id: id4.clone(), reply_to: None, quote_of: Some(id2.clone()) });
+        data.ingest_record(BskyPostRecord { id: id5.clone(), reply_to: None, quote_of: Some(id2.clone()) });
+
+        assert_eq!(data.posts.len(), 5);
+        assert_eq!(data.pending.len(), 0);
+        assert_eq!(data.subgraph_stats.len(), 1);
+        assert_eq!(data.source_subgraphs.len(), 1);
+
+        let sub_infos_maybe = data.source_subgraphs.get(&id1);
+        assert!(sub_infos_maybe.is_some());
+        let sub_infos = sub_infos_maybe.unwrap();
+        assert_eq!(sub_infos.len(), 1);
+        let sub_info = sub_infos[0];
+        assert_eq!(sub_info.ty, SubgraphType::Quote);
+        let sid = sub_info.id;
+        let stats_maybe = data.subgraph_stats.get(&sid);
+        assert!(stats_maybe.is_some());
+        let stats = stats_maybe.unwrap();
+        assert_eq!(stats.size, 5);
+        assert_eq!(stats.max_width, 3);
+        assert_eq!(stats.max_depth, 3);
+
+        let post4 = data.posts.get(&id4);
+        assert!(post4.is_some());
+        let post = post4.unwrap();
+        assert!(post.ro_root.is_none());
+        assert!(post.qo_root.is_some());
+        let post_qo_root = post.qo_root.as_ref().unwrap();
+        assert_eq!(&post_qo_root.did, &id1.did);
+        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 3);
         assert_eq!(post.rq_max_depth, 3);
         assert!(post.is_ro_leaf);
         assert!(post.is_qo_leaf);
