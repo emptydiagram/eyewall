@@ -1,7 +1,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct BskyPostId {
     did: String,
     rkey: String,
@@ -57,21 +57,6 @@ struct BskyPostReplyTo {
     root: BskyPostId,
 }
 
-struct SubgraphStats {
-    size: u32,
-    max_width: u32,
-    max_depth: u32,
-}
-
-impl SubgraphStats {
-    fn new() -> SubgraphStats {
-        SubgraphStats {
-            size: 1,
-            max_width: 1,
-            max_depth: 1
-        }
-    }
-}
 
 type SubgraphId = u32;
 
@@ -82,17 +67,33 @@ enum SubgraphType {
     ReplyQuote,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SubgraphInfo {
-    id: SubgraphId,
     ty: SubgraphType,
+    sources: Vec<BskyPostId>,
+    size: u32,
+    max_width: u32,
+    max_depth: u32,
 }
+
+impl SubgraphInfo {
+    fn new(ty: SubgraphType, sources: Vec<BskyPostId>, size: u32, max_width: u32, max_depth: u32) -> SubgraphInfo {
+        SubgraphInfo {
+            ty,
+            sources,
+            size,
+            max_width,
+            max_depth
+        }
+    }
+}
+
 
 struct BskyGraphData {
     posts: HashMap<BskyPostId, BskyPostGraphData>,
     pending: HashSet<BskyPostRecord>,
-    subgraph_stats: HashMap<SubgraphId, SubgraphStats>,
-    source_subgraphs: HashMap<BskyPostId, Vec<SubgraphInfo>>,
+    subgraphs: HashMap<SubgraphId, SubgraphInfo>,
+    subgraph_nodes: HashMap<SubgraphId, Vec<BskyPostId>>,
     next_subgraph_id: u32,
 }
 
@@ -101,23 +102,19 @@ impl BskyGraphData {
         BskyGraphData {
             posts: HashMap::new(),
             pending: HashSet::new(),
-            subgraph_stats: HashMap::new(),
-            source_subgraphs: HashMap::new(),
+            subgraphs: HashMap::new(),
+            subgraph_nodes: HashMap::new(),
             next_subgraph_id: 1,
         }
     }
 
-    fn make_subgraph(&mut self, post_ids: &mut dyn Iterator<Item = BskyPostId>, subgraph_type: SubgraphType) -> SubgraphId {
+    fn make_subgraph(&mut self, post_ids: Vec<BskyPostId>, subgraph_type: SubgraphType, size: u32, max_width: u32, max_depth: u32) -> SubgraphId {
         let subgraph_id = self.next_subgraph_id;
         self.next_subgraph_id += 1;
-        self.subgraph_stats.insert(subgraph_id, SubgraphStats::new());
 
-        println!("Making subgraph, id = {}, type = {:?}", subgraph_id, subgraph_type);
+        self.subgraphs.insert(subgraph_id, SubgraphInfo::new(subgraph_type, post_ids.clone(), size, max_width, max_depth));
 
-        for post_id in post_ids {
-            let sources = self.source_subgraphs.entry(post_id).or_insert(Vec::new());
-            sources.push(SubgraphInfo { id: subgraph_id, ty: subgraph_type });
-        }
+        self.subgraph_nodes.insert(subgraph_id, post_ids);
         subgraph_id
     }
 
@@ -145,48 +142,48 @@ impl BskyGraphData {
             let rq_max_depth = parent_data.rq_max_depth + 1;
             let parent_was_ro_leaf = parent_data.is_ro_leaf;
             let parent_was_rq_leaf = parent_data.is_rq_leaf;
+            let parent_qo_sid_maybe = parent_data.qo_sid;
+            let parent_rq_sid_maybe = parent_data.rq_sid;
             parent_data.is_ro_leaf = false;
             parent_data.is_rq_leaf = false;
 
             let ro_sid: SubgraphId;
 
-            // parent is a reply root iff ro_root is None. we defer creating a subgraph until we have a parent/child
+            // parent is a reply root iff ro_sid is None. we defer creating a subgraph until we have a parent/child
             // relationship, so we have to create it here
             // if parent_data.ro_sid.is_none() && !self.source_subgraphs.contains_key(&reply_to.target) {
             if parent_data.ro_sid.is_none() {
-                if self.source_subgraphs.contains_key(&reply_to.target) {
-                    panic!("source_subgraphs unexpectedly contains entry");
-                }
                 let post_ids = vec![reply_to.target.clone()];
-                ro_sid = self.make_subgraph( &mut post_ids.into_iter(), SubgraphType::Reply);
-                parent_data.ro_sid = Some(ro_sid);
+                ro_sid = self.make_subgraph( post_ids, SubgraphType::Reply, 1, 1, 1);
+                let parent_post = self.posts.get_mut(&reply_to.target).unwrap();
+                parent_post.ro_sid = Some(ro_sid);
                 // don't insert RQ subgraph yet. only do it if it's actually different from the R subgraph,
                 // which happens if some post in the R subgraph gets quoted
             } else {
                 ro_sid = parent_data.ro_sid.unwrap();
             }
 
-            // if we replied to a post in quote subgraph. and the corresponding RQ graph doesnt exist
+            // if we replied to a post in quote subgraph and the corresponding RQ graph doesnt exist
+            let mut rq_sid_maybe: Option<SubgraphId> = None;
+            if parent_qo_sid_maybe.is_some() && parent_rq_sid_maybe.is_none() {
+                let qo_sid = parent_qo_sid_maybe.unwrap();
+                let qo_subgraph = self.subgraphs.get(&qo_sid).expect("Expected quote subgraph");
+                let post_ids = qo_subgraph.sources.clone();
+                let sid = self.make_subgraph(post_ids, SubgraphType::ReplyQuote, qo_subgraph.size, qo_subgraph.max_width, qo_subgraph.max_depth);
+                rq_sid_maybe = Some(sid);
 
-            if let Some(parent_qo_sid) = parent_data.qo_sid {
-                let source = match self.posts.get(&parent_qo_root).expect("Expected parent qo root").ro_root {
-                    Some(ref pqr_ro_root) => pqr_ro_root,
-                    None => parent_qo_root,
-                };
-
-                // TODO: is it possible to have more than one root?
-                let source_subgraphs_maybe = self.source_subgraphs.get(source);
-                if source_subgraphs_maybe.is_none() || source_subgraphs_maybe.unwrap().iter().all(|si| si.ty != SubgraphType::ReplyQuote) {
-                    let post_ids = vec![source.clone()];
-                    let sid = self.make_subgraph(&mut post_ids.into_iter(), SubgraphType::ReplyQuote);
-                    rq_sid_maybe = Some(sid);
+                for node in self.subgraph_nodes.get(&qo_sid).expect("Expected subgraph nodes") {
+                    let post = self.posts.get_mut(node).unwrap();
+                    post.rq_sid = rq_sid_maybe;
                 }
+            } else if parent_rq_sid_maybe.is_some() {
+                rq_sid_maybe = parent_rq_sid_maybe;
             }
 
             let tree_data = BskyPostGraphData {
                 ro_sid: Some(ro_sid),
                 qo_sid: None,
-                rq_sid: None,
+                rq_sid: rq_sid_maybe,
                 ro_depth: ro_depth,
                 qo_depth: 1,
                 rq_max_depth: rq_max_depth,
@@ -197,42 +194,34 @@ impl BskyGraphData {
 
             self.posts.insert(record.id.clone(), tree_data);
 
+            self.subgraph_nodes.entry(ro_sid).and_modify(|e| e.push(record.id.clone()));
+
             // the new post we just inserted is part of at most two subgraphs:
             //  - reply subgraph
             //  - reply-quote subgraph
             // find each of these, if they exist, and update the appropriate stats
 
-            if ro_sid_maybe.is_none() {
-                // if we're here, it's a reply to a non-reply-root post, so the subgraph already exists
-                let root_subgraphs = self.source_subgraphs
-                    .get(&reply_to.root)
-                    .expect("Expected reply root to have subgraph");
-                for sg in root_subgraphs {
-                    if sg.ty == SubgraphType::Reply {
-                        ro_sid_maybe = Some(sg.id);
-                        break;
-                    }
+            let ro_subgraph = self.subgraphs
+                .get_mut(&ro_sid)
+                .expect("Expected reply subgraph to exist for reply");
+
+            ro_subgraph.size += 1;
+            ro_subgraph.max_depth = ro_subgraph.max_depth.max(ro_depth);
+            if !parent_was_ro_leaf {
+                ro_subgraph.max_width += 1;
+            }
+
+            if let Some(rq_sid) = rq_sid_maybe {
+                let rq_subgraph = self.subgraphs
+                    .get_mut(&rq_sid)
+                    .expect("Expected reply-quote subgraph to exist for reply");
+
+                rq_subgraph.size += 1;
+                rq_subgraph.max_depth = rq_subgraph.max_depth.max(rq_max_depth);
+                if !parent_was_rq_leaf {
+                    rq_subgraph.max_width += 1;
                 }
             }
-
-            if rq_sid_maybe.is_none() {
-                // if we're here, either it's not part of an RQ subgraph, or it is and it previously already existed
-                // TODO: how to get subgraph id? currently no way to know what the root is
-            }
-
-            let ro_sid = ro_sid_maybe.expect("Expected reply subgraph to exist for reply");
-
-            let ro_sg_stats = self.subgraph_stats
-                .get_mut(&ro_sid)
-                .expect("Expected reply subgraph stats to exist for reply");
-
-            ro_sg_stats.size += 1;
-            ro_sg_stats.max_depth = ro_sg_stats.max_depth.max(ro_depth);
-            if !parent_was_ro_leaf {
-                ro_sg_stats.max_width += 1;
-            }
-
-            // TODO: reply-quote subgraph
 
         } else if record.reply_to.is_none() {
             let target = record.quote_of.as_ref().unwrap();
@@ -243,22 +232,56 @@ impl BskyGraphData {
 
             // not pending, didn't process yet
 
+            // calculate depths for the new node, update parent leaf flags
             let parent_data = self.posts.get_mut(target).unwrap();
-            let parent_is_root = parent_data.qo_root.is_none();
-            let qo_root = if parent_is_root {
-                target.clone()
-            } else {
-                parent_data.qo_root.as_ref().expect("Expected quote parent to have root").clone()
-            };
             let qo_depth = parent_data.qo_depth + 1;
             let rq_max_depth = parent_data.rq_max_depth + 1;
             let parent_was_qo_leaf = parent_data.is_qo_leaf;
             let parent_was_rq_leaf = parent_data.is_rq_leaf;
+            let parent_ro_sid_maybe = parent_data.ro_sid;
+            let parent_rq_sid_maybe = parent_data.rq_sid;
             parent_data.is_qo_leaf = false;
             parent_data.is_rq_leaf = false;
+
+            let qo_sid: SubgraphId;
+
+            // parent is a quote root iff qo_sid is None. we defer creating a subgraph until we have a parent/child
+            // relationship, so we have to create it here
+            // if parent_data.ro_sid.is_none() && !self.source_subgraphs.contains_key(&reply_to.target) {
+            if parent_data.qo_sid.is_none() {
+                let post_ids = vec![target.clone()];
+                qo_sid = self.make_subgraph( post_ids, SubgraphType::Quote, 1, 1, 1);
+                let parent_post = self.posts.get_mut(target).unwrap();
+                parent_post.qo_sid = Some(qo_sid);
+                // don't insert RQ subgraph yet. only do it if it's actually different from the R subgraph,
+                // which happens if some post in the R subgraph gets quoted
+            } else {
+                qo_sid = parent_data.qo_sid.unwrap();
+            }
+
+
+            // if we quoted a post in reply subgraph and the corresponding RQ graph doesnt exist
+            let mut rq_sid_maybe: Option<SubgraphId> = None;
+            if parent_ro_sid_maybe.is_some() && parent_rq_sid_maybe.is_none() {
+                let ro_sid = parent_ro_sid_maybe.unwrap();
+                let ro_subgraph = self.subgraphs.get(&ro_sid).expect("Expected reply subgraph");
+                let post_ids = ro_subgraph.sources.clone();
+                let sid = self.make_subgraph(post_ids, SubgraphType::ReplyQuote, ro_subgraph.size, ro_subgraph.max_width, ro_subgraph.max_depth);
+                rq_sid_maybe = Some(sid);
+
+                for node in self.subgraph_nodes.get(&ro_sid).expect("Expected subgraph nodes") {
+                    let post = self.posts.get_mut(node).unwrap();
+                    post.rq_sid = rq_sid_maybe;
+                }
+            } else if parent_rq_sid_maybe.is_some() {
+                rq_sid_maybe = parent_rq_sid_maybe;
+            }
+
+
             let tree_data = BskyPostGraphData {
-                ro_root: None,
-                qo_root: Some(qo_root.clone()),
+                ro_sid: None,
+                qo_sid: Some(qo_sid),
+                rq_sid: rq_sid_maybe,
                 ro_depth: 1,
                 qo_depth: qo_depth,
                 rq_max_depth: rq_max_depth,
@@ -267,50 +290,36 @@ impl BskyGraphData {
                 is_rq_leaf: true
             };
 
-            // parent is a quote root iff qo_root is None. we defer creating a subgraph until we have a parent/child
-            // relationship, so we have to create it here
-            let mut qo_sid_maybe = None;
-            if parent_is_root && !self.source_subgraphs.contains_key(&target) {
-                let post_ids = vec![target.clone()];
-                let sid = self.make_subgraph(&mut post_ids.into_iter(), SubgraphType::Quote);
-                qo_sid_maybe = Some(sid);
-                // don't insert RQ subgraph yet. only do it if it's actually different from the R subgraph,
-                // which happens if some post in the Q subgraph gets a reply
-            }
-
             self.posts.insert(record.id.clone(), tree_data);
 
+            self.subgraph_nodes.entry(qo_sid).and_modify(|e| e.push(record.id.clone()));
+
             // the new post we just inserted is part of at most two subgraphs:
-            //  - quote subgraph
+            //  - reply subgraph
             //  - reply-quote subgraph
             // find each of these, if they exist, and update the appropriate stats
 
-            if qo_sid_maybe.is_none() {
-                // if we're here, it's a reply to a non-reply-root post, so the subgraph already exists
-                let root_subgraphs = self.source_subgraphs
-                    .get(&qo_root)
-                    .expect("Expected quote root to have subgraph");
-                for sg in root_subgraphs {
-                    if sg.ty == SubgraphType::Quote {
-                        qo_sid_maybe = Some(sg.id);
-                        break;
-                    }
+            let qo_subgraph = self.subgraphs
+                .get_mut(&qo_sid)
+                .expect("Expected reply subgraph to exist for reply");
+
+            qo_subgraph.size += 1;
+            qo_subgraph.max_depth = qo_subgraph.max_depth.max(qo_depth);
+            if !parent_was_qo_leaf {
+                qo_subgraph.max_width += 1;
+            }
+
+            if let Some(rq_sid) = rq_sid_maybe {
+                let rq_subgraph = self.subgraphs
+                    .get_mut(&rq_sid)
+                    .expect("Expected reply-quote subgraph to exist for reply");
+
+                rq_subgraph.size += 1;
+                rq_subgraph.max_depth = rq_subgraph.max_depth.max(rq_max_depth);
+                if !parent_was_rq_leaf {
+                    rq_subgraph.max_width += 1;
                 }
             }
-
-            let qo_sid = qo_sid_maybe.expect("Expected reply subgraph to exist for reply");
-
-            let qo_sg_stats = self.subgraph_stats
-                .get_mut(&qo_sid)
-                .expect("Expected quote subgraph stats to exist for reply");
-
-            qo_sg_stats.size += 1;
-            qo_sg_stats.max_depth = qo_sg_stats.max_depth.max(qo_depth);
-            if !parent_was_qo_leaf {
-                qo_sg_stats.max_width += 1;
-            }
-
-            // TODO: reply-quote subgraph
 
         } else {
             let reply_to = record.reply_to.as_ref().unwrap();
@@ -343,14 +352,14 @@ mod tests {
 
         assert_eq!(data.posts.len(), 2);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 0);
-        assert_eq!(data.source_subgraphs.len(), 0);
+        assert_eq!(data.subgraphs.len(), 0);
 
         let post1 = data.posts.get(&id1);
         assert!(post1.is_some());
         let post = post1.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 1);
@@ -361,8 +370,9 @@ mod tests {
         let post2 = data.posts.get(&id2);
         assert!(post2.is_some());
         let post = post2.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 1);
@@ -384,14 +394,15 @@ mod tests {
 
         assert_eq!(data.posts.len(), 3);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 1);
-        assert_eq!(data.source_subgraphs.len(), 1);
+        assert_eq!(data.subgraphs.len(), 1);
 
         let post1 = data.posts.get(&id1);
         assert!(post1.is_some());
         let post = post1.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 1);
@@ -402,11 +413,10 @@ mod tests {
         let post2 = data.posts.get(&id2);
         assert!(post2.is_some());
         let post = post2.unwrap();
-        assert!(post.ro_root.is_some());
-        let post_ro_root = post.ro_root.as_ref().unwrap();
-        assert_eq!(&post_ro_root.did, &id1.did);
-        assert_eq!(&post_ro_root.rkey, &id1.rkey);
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 2);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 2);
@@ -417,11 +427,10 @@ mod tests {
         let post3 = data.posts.get(&id3);
         assert!(post3.is_some());
         let post = post3.unwrap();
-        assert!(post.ro_root.is_some());
-        let post_ro_root = post.ro_root.as_ref().unwrap();
-        assert_eq!(&post_ro_root.did, &id1.did);
-        assert_eq!(&post_ro_root.rkey, &id1.rkey);
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 3);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 3);
@@ -429,19 +438,16 @@ mod tests {
         assert!(post.is_qo_leaf);
         assert!(post.is_rq_leaf);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 1);
-        let sub_info = sub_infos[0];
-        assert_eq!(sub_info.ty, SubgraphType::Reply);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 3);
-        assert_eq!(stats.max_width, 1);
-        assert_eq!(stats.max_depth, 3);
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Reply);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 3);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 3);
     }
 
     #[test]
@@ -457,14 +463,15 @@ mod tests {
 
         assert_eq!(data.posts.len(), 3);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 1);
-        assert_eq!(data.source_subgraphs.len(), 1);
+        assert_eq!(data.subgraphs.len(), 1);
 
         let post1 = data.posts.get(&id1);
         assert!(post1.is_some());
         let post = post1.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 1);
@@ -475,11 +482,11 @@ mod tests {
         let post2 = data.posts.get(&id2);
         assert!(post2.is_some());
         let post = post2.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_some());
-        let post_qo_root = post.qo_root.as_ref().unwrap();
-        assert_eq!(&post_qo_root.did, &id1.did);
-        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
+
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 2);
         assert_eq!(post.rq_max_depth, 2);
@@ -490,11 +497,10 @@ mod tests {
         let post3 = data.posts.get(&id3);
         assert!(post3.is_some());
         let post = post3.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_some());
-        let post_qo_root = post.qo_root.as_ref().unwrap();
-        assert_eq!(&post_qo_root.did, &id1.did);
-        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 3);
         assert_eq!(post.rq_max_depth, 3);
@@ -502,19 +508,16 @@ mod tests {
         assert!(post.is_qo_leaf);
         assert!(post.is_rq_leaf);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 1);
-        let sub_info = sub_infos[0];
-        assert_eq!(sub_info.ty, SubgraphType::Quote);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 3);
-        assert_eq!(stats.max_width, 1);
-        assert_eq!(stats.max_depth, 3);
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Quote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 3);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 3);
     }
 
     #[test]
@@ -536,33 +539,86 @@ mod tests {
 
         assert_eq!(data.posts.len(), 3);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 3);
-        assert_eq!(data.source_subgraphs.len(), 2);
+        assert_eq!(data.subgraphs.len(), 3);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 2);
+        let post1 = data.posts.get(&id1);
+        assert!(post1.is_some());
+        let post = post1.unwrap();
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 1);
+        assert!(post.is_ro_leaf);
+        assert!(!post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
 
-        let sub_info = sub_infos[0];
-        assert_eq!(sub_info.ty, SubgraphType::Quote);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 2);
-        assert_eq!(stats.max_width, 1);
-        assert_eq!(stats.max_depth, 2);
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 2);
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(!post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
 
-        let sub_info = sub_infos[1];
-        assert_eq!(sub_info.ty, SubgraphType::ReplyQuote);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 3);
-        assert_eq!(stats.max_width, 1);
-        assert_eq!(stats.max_depth, 3);
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 2);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 2);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 3);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Quote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 2;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Reply);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id2);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 3;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::ReplyQuote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 3);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 3);
 
     }
 
@@ -585,23 +641,86 @@ mod tests {
 
         assert_eq!(data.posts.len(), 3);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 3);
-        assert_eq!(data.source_subgraphs.len(), 3);
+        assert_eq!(data.subgraphs.len(), 3);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 2);
-        // let sub_info = sub_infos[0];
-        // assert_eq!(sub_info.ty, SubgraphType::Quote);
-        // let sid = sub_info.id;
-        // let stats_maybe = data.subgraph_stats.get(&sid);
-        // assert!(stats_maybe.is_some());
-        // let stats = stats_maybe.unwrap();
-        // assert_eq!(stats.size, 3);
-        // assert_eq!(stats.max_width, 1);
-        // assert_eq!(stats.max_depth, 3);
+        let post1 = data.posts.get(&id1);
+        assert!(post1.is_some());
+        let post = post1.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 1);
+        assert!(!post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
 
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 2);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 2);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(!post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
+
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 2);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 3);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Reply);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 2;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Quote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id2);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 3;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::ReplyQuote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 3);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 3);
     }
 
     #[test]
@@ -622,13 +741,86 @@ mod tests {
 
         assert_eq!(data.posts.len(), 3);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 3);
-        assert_eq!(data.source_subgraphs.len(), 3);
+        assert_eq!(data.subgraphs.len(), 3);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 2);
+        let post1 = data.posts.get(&id1);
+        assert!(post1.is_some());
+        let post = post1.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 2);
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 1);
+        assert!(!post.is_ro_leaf);
+        assert!(!post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
+
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 2);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 2);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Quote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 2;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Reply);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 3;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::ReplyQuote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 3);
+        assert_eq!(sg.max_width, 2);
+        assert_eq!(sg.max_depth, 2);
     }
 
     #[test]
@@ -649,13 +841,86 @@ mod tests {
 
         assert_eq!(data.posts.len(), 3);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 3);
-        assert_eq!(data.source_subgraphs.len(), 3);
+        assert_eq!(data.subgraphs.len(), 3);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 2);
+        let post1 = data.posts.get(&id1);
+        assert!(post1.is_some());
+        let post = post1.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 2);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 1);
+        assert!(!post.is_ro_leaf);
+        assert!(!post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
+
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 2);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 2);
+        assert!(post.rq_sid.is_some());
+        assert_eq!(post.rq_sid.unwrap(), 3);
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Reply);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 2;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Quote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 2);
+        assert_eq!(sg.max_width, 1);
+        assert_eq!(sg.max_depth, 2);
+
+        let sid = 3;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::ReplyQuote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 3);
+        assert_eq!(sg.max_width, 2);
+        assert_eq!(sg.max_depth, 2);
     }
 
     #[test]
@@ -673,17 +938,15 @@ mod tests {
 
         assert_eq!(data.posts.len(), 4);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 1);
-        assert_eq!(data.source_subgraphs.len(), 1);
+        assert_eq!(data.subgraphs.len(), 1);
 
         let post2 = data.posts.get(&id2);
         assert!(post2.is_some());
         let post = post2.unwrap();
-        assert!(post.ro_root.is_some());
-        let post_ro_root = post.ro_root.as_ref().unwrap();
-        assert_eq!(&post_ro_root.did, &id1.did);
-        assert_eq!(&post_ro_root.rkey, &id1.rkey);
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 2);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 2);
@@ -694,11 +957,10 @@ mod tests {
         let post3 = data.posts.get(&id3);
         assert!(post3.is_some());
         let post = post3.unwrap();
-        assert!(post.ro_root.is_some());
-        let post_ro_root = post.ro_root.as_ref().unwrap();
-        assert_eq!(&post_ro_root.did, &id1.did);
-        assert_eq!(&post_ro_root.rkey, &id1.rkey);
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 2);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 2);
@@ -709,11 +971,10 @@ mod tests {
         let post4 = data.posts.get(&id4);
         assert!(post4.is_some());
         let post = post4.unwrap();
-        assert!(post.ro_root.is_some());
-        let post_ro_root = post.ro_root.as_ref().unwrap();
-        assert_eq!(&post_ro_root.did, &id1.did);
-        assert_eq!(&post_ro_root.rkey, &id1.rkey);
-        assert!(post.qo_root.is_none());
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 2);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 2);
@@ -721,19 +982,16 @@ mod tests {
         assert!(post.is_qo_leaf);
         assert!(post.is_rq_leaf);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 1);
-        let sub_info = sub_infos[0];
-        assert_eq!(sub_info.ty, SubgraphType::Reply);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 4);
-        assert_eq!(stats.max_width, 3);
-        assert_eq!(stats.max_depth, 2);
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Reply);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 4);
+        assert_eq!(sg.max_width, 3);
+        assert_eq!(sg.max_depth, 2);
     }
 
     #[test]
@@ -751,17 +1009,15 @@ mod tests {
 
         assert_eq!(data.posts.len(), 4);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 1);
-        assert_eq!(data.source_subgraphs.len(), 1);
+        assert_eq!(data.subgraphs.len(), 1);
 
         let post2 = data.posts.get(&id2);
         assert!(post2.is_some());
         let post = post2.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_some());
-        let post_qo_root = post.qo_root.as_ref().unwrap();
-        assert_eq!(&post_qo_root.did, &id1.did);
-        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 2);
         assert_eq!(post.rq_max_depth, 2);
@@ -772,11 +1028,10 @@ mod tests {
         let post3 = data.posts.get(&id3);
         assert!(post3.is_some());
         let post = post3.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_some());
-        let post_qo_root = post.qo_root.as_ref().unwrap();
-        assert_eq!(&post_qo_root.did, &id1.did);
-        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 2);
         assert_eq!(post.rq_max_depth, 2);
@@ -787,11 +1042,10 @@ mod tests {
         let post4 = data.posts.get(&id4);
         assert!(post4.is_some());
         let post = post4.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_some());
-        let post_qo_root = post.qo_root.as_ref().unwrap();
-        assert_eq!(&post_qo_root.did, &id1.did);
-        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 2);
         assert_eq!(post.rq_max_depth, 2);
@@ -799,19 +1053,16 @@ mod tests {
         assert!(post.is_qo_leaf);
         assert!(post.is_rq_leaf);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 1);
-        let sub_info = sub_infos[0];
-        assert_eq!(sub_info.ty, SubgraphType::Quote);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 4);
-        assert_eq!(stats.max_width, 3);
-        assert_eq!(stats.max_depth, 2);
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Quote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 4);
+        assert_eq!(sg.max_width, 3);
+        assert_eq!(sg.max_depth, 2);
     }
 
     #[test]
@@ -831,37 +1082,60 @@ mod tests {
 
         assert_eq!(data.posts.len(), 5);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 1);
-        assert_eq!(data.source_subgraphs.len(), 1);
+        assert_eq!(data.subgraphs.len(), 1);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 1);
-        let sub_info = sub_infos[0];
-        assert_eq!(sub_info.ty, SubgraphType::Reply);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 5);
-        assert_eq!(stats.max_width, 3);
-        assert_eq!(stats.max_depth, 3);
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
+        assert_eq!(post.ro_depth, 2);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(!post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
 
-        let post4 = data.posts.get(&id4);
-        assert!(post4.is_some());
-        let post = post4.unwrap();
-        assert!(post.ro_root.is_some());
-        let post_ro_root = post.ro_root.as_ref().unwrap();
-        assert_eq!(&post_ro_root.did, &id1.did);
-        assert_eq!(&post_ro_root.rkey, &id1.rkey);
-        assert!(post.qo_root.is_none());
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 3);
         assert_eq!(post.qo_depth, 1);
         assert_eq!(post.rq_max_depth, 3);
         assert!(post.is_ro_leaf);
         assert!(post.is_qo_leaf);
         assert!(post.is_rq_leaf);
+
+        let post4 = data.posts.get(&id4);
+        assert!(post4.is_some());
+        let post = post4.unwrap();
+        assert!(post.ro_sid.is_some());
+        assert_eq!(post.ro_sid.unwrap(), 1);
+        assert!(post.qo_sid.is_none());
+        assert!(post.rq_sid.is_none());
+        assert_eq!(post.ro_depth, 3);
+        assert_eq!(post.qo_depth, 1);
+        assert_eq!(post.rq_max_depth, 3);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Reply);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 5);
+        assert_eq!(sg.max_width, 3);
+        assert_eq!(sg.max_depth, 3);
     }
 
     #[test]
@@ -881,36 +1155,59 @@ mod tests {
 
         assert_eq!(data.posts.len(), 5);
         assert_eq!(data.pending.len(), 0);
-        assert_eq!(data.subgraph_stats.len(), 1);
-        assert_eq!(data.source_subgraphs.len(), 1);
+        assert_eq!(data.subgraphs.len(), 1);
 
-        let sub_infos_maybe = data.source_subgraphs.get(&id1);
-        assert!(sub_infos_maybe.is_some());
-        let sub_infos = sub_infos_maybe.unwrap();
-        assert_eq!(sub_infos.len(), 1);
-        let sub_info = sub_infos[0];
-        assert_eq!(sub_info.ty, SubgraphType::Quote);
-        let sid = sub_info.id;
-        let stats_maybe = data.subgraph_stats.get(&sid);
-        assert!(stats_maybe.is_some());
-        let stats = stats_maybe.unwrap();
-        assert_eq!(stats.size, 5);
-        assert_eq!(stats.max_width, 3);
-        assert_eq!(stats.max_depth, 3);
+        let post2 = data.posts.get(&id2);
+        assert!(post2.is_some());
+        let post = post2.unwrap();
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 2);
+        assert_eq!(post.rq_max_depth, 2);
+        assert!(post.is_ro_leaf);
+        assert!(!post.is_qo_leaf);
+        assert!(!post.is_rq_leaf);
 
-        let post4 = data.posts.get(&id4);
-        assert!(post4.is_some());
-        let post = post4.unwrap();
-        assert!(post.ro_root.is_none());
-        assert!(post.qo_root.is_some());
-        let post_qo_root = post.qo_root.as_ref().unwrap();
-        assert_eq!(&post_qo_root.did, &id1.did);
-        assert_eq!(&post_qo_root.rkey, &id1.rkey);
+        let post3 = data.posts.get(&id3);
+        assert!(post3.is_some());
+        let post = post3.unwrap();
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
         assert_eq!(post.ro_depth, 1);
         assert_eq!(post.qo_depth, 3);
         assert_eq!(post.rq_max_depth, 3);
         assert!(post.is_ro_leaf);
         assert!(post.is_qo_leaf);
         assert!(post.is_rq_leaf);
+
+        let post4 = data.posts.get(&id4);
+        assert!(post4.is_some());
+        let post = post4.unwrap();
+        assert!(post.ro_sid.is_none());
+        assert!(post.qo_sid.is_some());
+        assert_eq!(post.qo_sid.unwrap(), 1);
+        assert!(post.rq_sid.is_none());
+        assert_eq!(post.ro_depth, 1);
+        assert_eq!(post.qo_depth, 3);
+        assert_eq!(post.rq_max_depth, 3);
+        assert!(post.is_ro_leaf);
+        assert!(post.is_qo_leaf);
+        assert!(post.is_rq_leaf);
+
+        let sid = 1;
+        let sg_maybe = data.subgraphs.get(&sid);
+        assert!(sg_maybe.is_some());
+        let sg = sg_maybe.unwrap();
+        assert_eq!(sg.ty, SubgraphType::Quote);
+        assert_eq!(sg.sources.len(), 1);
+        assert_eq!(&sg.sources[0], &id1);
+        assert_eq!(sg.size, 5);
+        assert_eq!(sg.max_width, 3);
+        assert_eq!(sg.max_depth, 3);
     }
 }
