@@ -105,13 +105,17 @@ impl BskyGraphData {
         }
     }
 
-    fn make_subgraph(&mut self, post_id: BskyPostId, subgraph_type: SubgraphType) -> SubgraphId {
-        let subgraph_id = self.next_subgraph_id + 1;
+    fn make_subgraph(&mut self, post_ids: &mut dyn Iterator<Item = BskyPostId>, subgraph_type: SubgraphType) -> SubgraphId {
+        let subgraph_id = self.next_subgraph_id;
         self.next_subgraph_id += 1;
-
         self.subgraph_stats.insert(subgraph_id, SubgraphStats::new());
-        let sources = self.source_subgraphs.entry(post_id).or_insert(Vec::new());
-        sources.push(SubgraphInfo { id: subgraph_id, ty: subgraph_type });
+
+        println!("Making subgraph, id = {}, type = {:?}", subgraph_id, subgraph_type);
+
+        for post_id in post_ids {
+            let sources = self.source_subgraphs.entry(post_id).or_insert(Vec::new());
+            sources.push(SubgraphInfo { id: subgraph_id, ty: subgraph_type });
+        }
         subgraph_id
     }
 
@@ -139,6 +143,7 @@ impl BskyGraphData {
             let rq_max_depth = parent_data.rq_max_depth + 1;
             let parent_was_ro_leaf = parent_data.is_ro_leaf;
             let parent_was_rq_leaf = parent_data.is_rq_leaf;
+            let parent_qo_root_maybe = parent_data.qo_root.as_ref().map(|qr| qr.clone());
             parent_data.is_ro_leaf = false;
             parent_data.is_rq_leaf = false;
             let tree_data = BskyPostGraphData {
@@ -156,10 +161,45 @@ impl BskyGraphData {
             // relationship, so we have to create it here
             let mut ro_sid_maybe = None;
             if parent_data.ro_root.is_none() && !self.source_subgraphs.contains_key(&reply_to.target) {
-                let sid = self.make_subgraph(reply_to.target.clone(), SubgraphType::Reply);
+                let post_ids = vec![reply_to.target.clone()];
+                let sid = self.make_subgraph( &mut post_ids.into_iter(), SubgraphType::Reply);
                 ro_sid_maybe = Some(sid);
                 // don't insert RQ subgraph yet. only do it if it's actually different from the R subgraph,
                 // which happens if some post in the R subgraph gets quoted
+            }
+
+            // if we replied to a post in quote subgraph. and the corresponding RQ graph doesnt exist
+
+            let mut rq_sid_maybe = None;
+            let parent_qo_root_maybe = {
+                if parent_qo_root_maybe.is_some() {
+                    parent_qo_root_maybe.as_ref()
+                } else {
+                    match self.source_subgraphs.get(&reply_to.target) {
+                        None => None,
+                        Some(infos) => {
+                            if infos.iter().any(|si| si.ty == SubgraphType::Quote) {
+                                Some(&reply_to.target)
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(parent_qo_root) = parent_qo_root_maybe {
+                let source = match self.posts.get(&parent_qo_root).expect("Expected parent qo root").ro_root {
+                    Some(ref pqr_ro_root) => pqr_ro_root,
+                    None => parent_qo_root,
+                };
+
+                // TODO: is it possible to have more than one root?
+                let source_subgraphs_maybe = self.source_subgraphs.get(source);
+                if source_subgraphs_maybe.is_none() || source_subgraphs_maybe.unwrap().iter().all(|si| si.ty != SubgraphType::ReplyQuote) {
+                    let post_ids = vec![source.clone()];
+                    let sid = self.make_subgraph(&mut post_ids.into_iter(), SubgraphType::ReplyQuote);
+                    rq_sid_maybe = Some(sid);
+                }
             }
 
             self.posts.insert(record.id.clone(), tree_data);
@@ -180,6 +220,11 @@ impl BskyGraphData {
                         break;
                     }
                 }
+            }
+
+            if rq_sid_maybe.is_none() {
+                // if we're here, either it's not part of an RQ subgraph, or it is and it previously already existed
+                // TODO: how to get subgraph id? currently no way to know what the root is
             }
 
             let ro_sid = ro_sid_maybe.expect("Expected reply subgraph to exist for reply");
@@ -233,7 +278,8 @@ impl BskyGraphData {
             // relationship, so we have to create it here
             let mut qo_sid_maybe = None;
             if parent_is_root && !self.source_subgraphs.contains_key(&target) {
-                let sid = self.make_subgraph(target.clone(), SubgraphType::Quote);
+                let post_ids = vec![target.clone()];
+                let sid = self.make_subgraph(&mut post_ids.into_iter(), SubgraphType::Quote);
                 qo_sid_maybe = Some(sid);
                 // don't insert RQ subgraph yet. only do it if it's actually different from the R subgraph,
                 // which happens if some post in the Q subgraph gets a reply
@@ -498,21 +544,32 @@ mod tests {
         assert_eq!(data.posts.len(), 3);
         assert_eq!(data.pending.len(), 0);
         assert_eq!(data.subgraph_stats.len(), 3);
-        assert_eq!(data.source_subgraphs.len(), 3);
+        assert_eq!(data.source_subgraphs.len(), 2);
 
         let sub_infos_maybe = data.source_subgraphs.get(&id1);
         assert!(sub_infos_maybe.is_some());
         let sub_infos = sub_infos_maybe.unwrap();
         assert_eq!(sub_infos.len(), 2);
-        // let sub_info = sub_infos[0];
-        // assert_eq!(sub_info.ty, SubgraphType::Quote);
-        // let sid = sub_info.id;
-        // let stats_maybe = data.subgraph_stats.get(&sid);
-        // assert!(stats_maybe.is_some());
-        // let stats = stats_maybe.unwrap();
-        // assert_eq!(stats.size, 3);
-        // assert_eq!(stats.max_width, 1);
-        // assert_eq!(stats.max_depth, 3);
+
+        let sub_info = sub_infos[0];
+        assert_eq!(sub_info.ty, SubgraphType::Quote);
+        let sid = sub_info.id;
+        let stats_maybe = data.subgraph_stats.get(&sid);
+        assert!(stats_maybe.is_some());
+        let stats = stats_maybe.unwrap();
+        assert_eq!(stats.size, 2);
+        assert_eq!(stats.max_width, 1);
+        assert_eq!(stats.max_depth, 2);
+
+        let sub_info = sub_infos[1];
+        assert_eq!(sub_info.ty, SubgraphType::ReplyQuote);
+        let sid = sub_info.id;
+        let stats_maybe = data.subgraph_stats.get(&sid);
+        assert!(stats_maybe.is_some());
+        let stats = stats_maybe.unwrap();
+        assert_eq!(stats.size, 3);
+        assert_eq!(stats.max_width, 1);
+        assert_eq!(stats.max_depth, 3);
 
     }
 
