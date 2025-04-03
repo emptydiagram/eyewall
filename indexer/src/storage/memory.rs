@@ -117,6 +117,9 @@ impl BskyGraphData {
 
     fn ingest_record(&mut self, record: BskyPostRecord) {
         // invariant: if a post has been processed, all ancestors have also
+        if self.posts.contains_key(&record.id) {
+            return;
+        }
         if record.reply_to.is_none() && record.quote_of.is_none() {
             let record_id = record.id.clone();
             self.posts.insert(record.id, BskyPostGraphData::new_root());
@@ -125,9 +128,6 @@ impl BskyGraphData {
             let reply_to = record.reply_to.as_ref().unwrap();
             if !self.posts.contains_key(&reply_to.target) {
                 self.pending.insert(record.clone());
-                return;
-            }
-            if self.posts.contains_key(&record.id) {
                 return;
             }
 
@@ -202,9 +202,6 @@ impl BskyGraphData {
                 self.pending.insert(record.clone());
                 return;
             }
-            if self.posts.contains_key(&record.id) {
-                return;
-            }
 
             // not pending, didn't process yet
 
@@ -277,6 +274,14 @@ impl BskyGraphData {
             // TODO: reply-quote subgraph
 
         } else {
+            let reply_to = record.reply_to.as_ref().unwrap();
+            let quote_target = record.quote_of.as_ref().unwrap();
+
+            if !self.posts.contains_key(&reply_to.target) || !self.posts.contains_key(quote_target) {
+                self.pending.insert(record.clone());
+                return;
+            }
+
             panic!("TODO");
         }
     }
@@ -471,6 +476,136 @@ mod tests {
         assert_eq!(stats.size, 3);
         assert_eq!(stats.max_width, 1);
         assert_eq!(stats.max_depth, 3);
+    }
+
+    #[test]
+    fn test_simple_quote_reply_graph_1() {
+        let mut data = BskyGraphData::new();
+
+        //  1
+        //  \Q\
+        //    2
+        //   |R|
+        //    3
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "2");
+        let id3 = BskyPostId::from("a", "2");
+        data.ingest_record(BskyPostRecord { id: id1.clone(), reply_to: None, quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id2.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+        data.ingest_record(BskyPostRecord { id: id3.clone(), reply_to: Some(BskyPostReplyTo { target: id2.clone(), root: id2.clone() }), quote_of: None });
+
+        assert_eq!(data.posts.len(), 3);
+        assert_eq!(data.pending.len(), 0);
+        assert_eq!(data.subgraph_stats.len(), 3);
+        assert_eq!(data.source_subgraphs.len(), 3);
+
+        let sub_infos_maybe = data.source_subgraphs.get(&id1);
+        assert!(sub_infos_maybe.is_some());
+        let sub_infos = sub_infos_maybe.unwrap();
+        assert_eq!(sub_infos.len(), 2);
+        // let sub_info = sub_infos[0];
+        // assert_eq!(sub_info.ty, SubgraphType::Quote);
+        // let sid = sub_info.id;
+        // let stats_maybe = data.subgraph_stats.get(&sid);
+        // assert!(stats_maybe.is_some());
+        // let stats = stats_maybe.unwrap();
+        // assert_eq!(stats.size, 3);
+        // assert_eq!(stats.max_width, 1);
+        // assert_eq!(stats.max_depth, 3);
+
+    }
+
+    #[test]
+    fn test_simple_quote_reply_graph_2() {
+        let mut data = BskyGraphData::new();
+
+        //  1
+        // |R|
+        //  2
+        //  \Q\
+        //    3
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "2");
+        let id3 = BskyPostId::from("a", "2");
+        data.ingest_record(BskyPostRecord { id: id1.clone(), reply_to: None, quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id2.clone(), reply_to: Some(BskyPostReplyTo { target: id1.clone(), root: id1.clone() }), quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id3.clone(), reply_to: None, quote_of: Some(id2.clone()) });
+
+        assert_eq!(data.posts.len(), 3);
+        assert_eq!(data.pending.len(), 0);
+        assert_eq!(data.subgraph_stats.len(), 3);
+        assert_eq!(data.source_subgraphs.len(), 3);
+
+        let sub_infos_maybe = data.source_subgraphs.get(&id1);
+        assert!(sub_infos_maybe.is_some());
+        let sub_infos = sub_infos_maybe.unwrap();
+        assert_eq!(sub_infos.len(), 2);
+        // let sub_info = sub_infos[0];
+        // assert_eq!(sub_info.ty, SubgraphType::Quote);
+        // let sid = sub_info.id;
+        // let stats_maybe = data.subgraph_stats.get(&sid);
+        // assert!(stats_maybe.is_some());
+        // let stats = stats_maybe.unwrap();
+        // assert_eq!(stats.size, 3);
+        // assert_eq!(stats.max_width, 1);
+        // assert_eq!(stats.max_depth, 3);
+
+    }
+
+    #[test]
+    fn test_simple_quote_reply_graph_3() {
+        let mut data = BskyGraphData::new();
+
+        //  1
+        //  \Q\
+        // |R| 2
+        //  3
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "2");
+        let id3 = BskyPostId::from("a", "2");
+        data.ingest_record(BskyPostRecord { id: id1.clone(), reply_to: None, quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id2.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+        data.ingest_record(BskyPostRecord { id: id3.clone(), reply_to: Some(BskyPostReplyTo { target: id1.clone(), root: id1.clone() }), quote_of: None });
+
+        assert_eq!(data.posts.len(), 3);
+        assert_eq!(data.pending.len(), 0);
+        assert_eq!(data.subgraph_stats.len(), 3);
+        assert_eq!(data.source_subgraphs.len(), 3);
+
+        let sub_infos_maybe = data.source_subgraphs.get(&id1);
+        assert!(sub_infos_maybe.is_some());
+        let sub_infos = sub_infos_maybe.unwrap();
+        assert_eq!(sub_infos.len(), 2);
+    }
+
+    #[test]
+    fn test_simple_quote_reply_graph_4() {
+        let mut data = BskyGraphData::new();
+
+        //  1
+        //  \Q\
+        // |R| 3
+        //  2
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "2");
+        let id3 = BskyPostId::from("a", "2");
+        data.ingest_record(BskyPostRecord { id: id1.clone(), reply_to: None, quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id2.clone(), reply_to: Some(BskyPostReplyTo { target: id1.clone(), root: id1.clone() }), quote_of: None });
+        data.ingest_record(BskyPostRecord { id: id3.clone(), reply_to: None, quote_of: Some(id1.clone()) });
+
+        assert_eq!(data.posts.len(), 3);
+        assert_eq!(data.pending.len(), 0);
+        assert_eq!(data.subgraph_stats.len(), 3);
+        assert_eq!(data.source_subgraphs.len(), 3);
+
+        let sub_infos_maybe = data.source_subgraphs.get(&id1);
+        assert!(sub_infos_maybe.is_some());
+        let sub_infos = sub_infos_maybe.unwrap();
+        assert_eq!(sub_infos.len(), 2);
     }
 
     #[test]
