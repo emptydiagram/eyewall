@@ -1,103 +1,570 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
-pub mod memory;
+// pub mod memory;
+
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BskyPostId {
+    did: String,
+    rkey: String,
+}
+
+impl BskyPostId {
+    fn from(did: &str, rkey: &str) -> BskyPostId {
+        BskyPostId { did: String::from(did), rkey: String::from(rkey) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubgraphType {
+    Reply,
+    Quote,
+    ReplyQuote,
+}
+
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct BskyPostReplyTo<Id> {
+    target: Id,
+    root: Id,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct BskyPostRecord<Id> {
+    id: Id,
+    reply_to: Option<BskyPostReplyTo<Id>>,
+    quote_of: Option<Id>,
+}
 
 type UFIndex = u32;
 type UFSize = u32;
 
-struct UnionFind {
-    parents: Vec<UFIndex>,
-    sizes: HashMap<UFIndex, UFSize>,
+#[derive(Debug)]
+struct BskyPostUnionFind<Id> {
+    id_to_index: HashMap<Id, UFIndex>,
+    parents_ro: HashMap<UFIndex, UFIndex>,
+    parents_qo: HashMap<UFIndex, UFIndex>,
+    parents_rq: HashMap<UFIndex, UFIndex>,
+    sizes_ro: HashMap<UFIndex, UFSize>,
+    sizes_qo: HashMap<UFIndex, UFSize>,
+    sizes_rq: HashMap<UFIndex, UFSize>,
     next_index: UFIndex,
 }
 
-impl UnionFind {
-    pub fn new() -> UnionFind {
-        UnionFind {
-            parents: Vec::new(),
-            sizes: HashMap::new(),
+impl<Id: Clone + Eq + Hash> BskyPostUnionFind<Id> {
+    pub fn new() -> BskyPostUnionFind<Id> {
+        BskyPostUnionFind {
+            id_to_index: HashMap::new(),
+            parents_ro: HashMap::new(),
+            parents_qo: HashMap::new(),
+            parents_rq: HashMap::new(),
+            sizes_ro: HashMap::new(),
+            sizes_qo: HashMap::new(),
+            sizes_rq: HashMap::new(),
             next_index: 0,
         }
     }
 
-    pub fn add(&mut self) -> UFIndex {
-        let idx = self.next_index;
-        self.parents.push(idx);
-        self.sizes.insert(idx, 1);
-        self.next_index += 1;
-        idx
+    fn get_index(&mut self, id: &Id) -> UFIndex {
+        match self.id_to_index.get(id) {
+            None => {
+                let idx = self.next_index;
+                self.id_to_index.insert(id.clone(), idx);
+                self.next_index += 1;
+                idx
+            },
+            Some(idx) => *idx,
+        }
+    }
+
+    pub fn ingest_post(&mut self, record: BskyPostRecord<Id>) -> bool {
+        if record.reply_to.is_none() && record.quote_of.is_none() {
+            return false;
+        }
+        let post_idx = self.get_index(&record.id);
+
+        if let Some(ref reply_to) = record.reply_to {
+            let root_idx = self.get_index(&reply_to.root);
+            let parent_idx = self.get_index(&reply_to.target);
+
+            // assuming that root has a parents_ro entry iff it has a sizes_ro entry.
+            // this is *only true* iff the root of the reply tree is always the UF root.
+            // but by construction it is, since we never have to call union() or find()
+            // for a reply tree.
+
+            let root_ro_size = match self.parents_ro.insert(root_idx, root_idx) {
+                None => 1,
+                Some(_) => *self.sizes_ro.get(&root_idx).unwrap(),
+            };
+            let mut new_root_ro_size = root_ro_size;
+            match self.parents_ro.insert(parent_idx, root_idx) {
+                None => {
+                    new_root_ro_size += 1;
+                },
+                Some(_) => (),
+            }
+            match self.parents_ro.insert(post_idx, root_idx) {
+                None => {
+                    new_root_ro_size += 1;
+                },
+                Some(_) => (),
+            }
+
+            if new_root_ro_size > root_ro_size {
+                self.sizes_ro.insert(root_idx, new_root_ro_size);
+            }
+
+            let mut rq_to_add = Vec::new();
+            if !self.parents_rq.contains_key(&post_idx) {
+                rq_to_add.push(post_idx);
+            }
+            if !self.parents_rq.contains_key(&root_idx) {
+                rq_to_add.push(root_idx);
+            }
+            if parent_idx != root_idx && !self.parents_rq.contains_key(&parent_idx) {
+                rq_to_add.push(parent_idx);
+            }
+
+            for idx in rq_to_add {
+                self.parents_rq.insert(idx, idx);
+                self.sizes_rq.insert(idx, 1);
+            }
+            if parent_idx != root_idx {
+                self.union_rq(root_idx, parent_idx);
+            }
+            self.union_rq(parent_idx, post_idx);
+        }
+
+        if let Some(ref quote_of) = record.quote_of {
+            let parent_idx = self.get_index(&quote_of);
+            // assuming: if it's not in parents_qo, it's also not in sizes_qo
+
+            match (self.parents_qo.get(&parent_idx), self.parents_qo.get(&post_idx)) {
+                (None, None) => {
+                    self.parents_qo.insert(parent_idx, parent_idx);
+                    self.parents_qo.insert(post_idx, parent_idx);
+                    self.sizes_qo.insert(parent_idx, 2);
+                },
+                (None, Some(post_parent)) => {
+                    let post_parent_idx = *post_parent;
+                    self.parents_qo.insert(parent_idx, parent_idx);
+                    self.sizes_qo.insert(parent_idx, 1);
+                    self.union_qo(parent_idx, post_parent_idx);
+                },
+                (Some(parent_parent), None) => {
+                    let parent_root_idx = self.find_qo(*parent_parent);
+                    self.parents_qo.insert(post_idx, parent_root_idx);
+                    self.sizes_qo.entry(parent_root_idx).and_modify(|e| *e += 1);
+                },
+                (Some(parent_parent), Some(post_parent)) => {
+                    self.union_qo(*parent_parent, *post_parent);
+                },
+            }
+
+            let mut rq_to_add = Vec::new();
+            if !self.parents_rq.contains_key(&post_idx) {
+                rq_to_add.push(post_idx);
+            }
+            if !self.parents_rq.contains_key(&parent_idx) {
+                rq_to_add.push(parent_idx);
+            }
+            for idx in rq_to_add {
+                self.parents_rq.insert(idx, idx);
+                self.sizes_rq.insert(idx, 1);
+            }
+            self.union_rq(parent_idx, post_idx);
+
+        }
+
+        true
     }
 
     // find the representative node for a given index
-    pub fn find(&mut self, idx: UFIndex) -> UFIndex {
+    fn find_qo(&mut self, idx: UFIndex) -> UFIndex {
         let mut curr_idx = idx;
-        while curr_idx != self.parents[curr_idx as usize] {
-            curr_idx = self.parents[curr_idx as usize];
+        let mut pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
+        while curr_idx != pa_idx {
+            curr_idx = pa_idx;
+            pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
         }
         let rep = curr_idx;
 
         curr_idx = idx;
-        while curr_idx != self.parents[curr_idx as usize] {
-            let curr_pa = self.parents[curr_idx as usize];
-            self.parents[curr_idx as usize] = rep;
-            curr_idx = curr_pa;
+        pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
+        while curr_idx != pa_idx {
+            self.parents_qo.insert(curr_idx, rep);
+            curr_idx = pa_idx;
+            pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
         }
-        rep
+        curr_idx
     }
 
-    pub fn union(&mut self, idx1: UFIndex, idx2: UFIndex) {
-        let pa1 = self.find(idx1);
-        let pa2 = self.find(idx2);
+    fn union_qo(&mut self, idx1: UFIndex, idx2: UFIndex) {
+        let pa1 = self.find_qo(idx1);
+        let pa2 = self.find_qo(idx2);
 
-        let pa1_size = self.sizes.get(&pa1).unwrap();
-        let pa2_size = self.sizes.get(&pa2).unwrap();
+        if pa1 == pa2 {
+            return;
+        }
 
-        if pa1_size > pa2_size {
-            self.parents[pa2 as usize] = pa1;
-            self.sizes.insert(pa1, pa1_size + pa2_size);
-            self.sizes.remove(&pa2);
+        let pa1_size = self.sizes_qo.get(&pa1).unwrap();
+        let pa2_size = self.sizes_qo.get(&pa2).unwrap();
+
+        if pa1_size >= pa2_size {
+            self.parents_qo.insert(pa2, pa1);
+            self.sizes_qo.insert(pa1, pa1_size + pa2_size);
+            self.sizes_qo.remove(&pa2);
         } else {
-            self.parents[pa1 as usize] = pa2;
-            self.sizes.insert(pa2, pa1_size + pa2_size);
-            self.sizes.remove(&pa1);
+            self.parents_qo.insert(pa1, pa2);
+            self.sizes_qo.insert(pa2, pa1_size + pa2_size);
+            self.sizes_qo.remove(&pa1);
         }
     }
 
-    pub fn component_size(&mut self, idx: UFIndex) -> UFSize {
-        let pa = self.find(idx);
-        *self.sizes.get(&pa).unwrap()
+    fn find_rq(&mut self, idx: UFIndex) -> UFIndex {
+        let mut curr_idx = idx;
+        let mut pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
+        while curr_idx != pa_idx {
+            curr_idx = pa_idx;
+            pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
+        }
+        let rep = curr_idx;
+
+        curr_idx = idx;
+        pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
+        while curr_idx != pa_idx {
+            self.parents_rq.insert(curr_idx, rep);
+            curr_idx = pa_idx;
+            pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
+        }
+        curr_idx
+    }
+
+    fn union_rq(&mut self, idx1: UFIndex, idx2: UFIndex) {
+        let pa1 = self.find_rq(idx1);
+        let pa2 = self.find_rq(idx2);
+
+        if pa1 == pa2 {
+            return;
+        }
+
+        let pa1_size = self.sizes_rq.get(&pa1).unwrap();
+        let pa2_size = self.sizes_rq.get(&pa2).unwrap();
+
+        if pa1_size >= pa2_size {
+            self.parents_rq.insert(pa2, pa1);
+            self.sizes_rq.insert(pa1, pa1_size + pa2_size);
+            self.sizes_rq.remove(&pa2);
+        } else {
+            self.parents_rq.insert(pa1, pa2);
+            self.sizes_rq.insert(pa2, pa1_size + pa2_size);
+            self.sizes_rq.remove(&pa1);
+        }
+    }
+
+    pub fn component_size(&mut self, subgraph_type: SubgraphType, id: &Id) -> Option<UFSize> {
+        let idx = self.id_to_index.get(id).map(|idx| *idx)?;
+        match subgraph_type {
+            SubgraphType::Reply => {
+                // special structure of replies means all non-root nodes are direct children of root
+                let pa = *self.parents_ro.get(&idx).unwrap();
+                self.sizes_ro.get(&pa).map(|idx| *idx)
+            },
+            SubgraphType::Quote => {
+                let pa = self.find_qo(idx);
+                self.sizes_qo.get(&pa).map(|idx| *idx)
+            },
+            SubgraphType::ReplyQuote => {
+                let pa = self.find_rq(idx);
+                self.sizes_rq.get(&pa).map(|idx| *idx)
+            },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::UnionFind;
+    use crate::storage::SubgraphType;
+
+    use super::{BskyPostId, BskyPostRecord, BskyPostUnionFind};
 
     #[test]
-    fn test_1() {
-        let mut uf = UnionFind::new();
-        let idx1 = uf.add();
-        let idx2 = uf.add();
-        let idx3 = uf.add();
-        uf.union(idx3, idx2);
-        assert_eq!(uf.component_size(idx1), 1);
-        assert_eq!(uf.component_size(idx2), 2);
-        assert_eq!(uf.component_size(idx3), 2);
-        uf.union(idx1, idx3);
-        assert_eq!(uf.component_size(idx1), 3);
-        assert_eq!(uf.component_size(idx2), 3);
-        assert_eq!(uf.component_size(idx3), 3);
-        let idx4 = uf.add();
-        let idx5 = uf.add();
-        let idx6 = uf.add();
-        uf.union(idx4, idx5);
-        uf.union(idx5, idx6);
-        assert_eq!(uf.component_size(idx1), 3);
-        assert_eq!(uf.component_size(idx4), 3);
-        assert_eq!(uf.component_size(idx5), 3);
-        assert_eq!(uf.component_size(idx6), 3);
-        uf.union(idx1, idx6);
-        assert_eq!(uf.component_size(idx3), 6);
-        assert_eq!(uf.component_size(idx4), 6);
+    fn test_simple_reply_thread_1() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: Some(super::BskyPostReplyTo { target: id1.clone(), root: id1.clone() }),
+            quote_of: None
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: Some(super::BskyPostReplyTo { target: id2.clone(), root: id1.clone() }),
+            quote_of: None
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: Some(super::BskyPostReplyTo { target: id3.clone(), root: id1.clone() }),
+            quote_of: None
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
+    }
+
+    #[test]
+    fn test_simple_reply_thread_2() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: Some(super::BskyPostReplyTo { target: id3.clone(), root: id1.clone() }),
+            quote_of: None
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: Some(super::BskyPostReplyTo { target: id2.clone(), root: id1.clone() }),
+            quote_of: None
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: Some(super::BskyPostReplyTo { target: id1.clone(), root: id1.clone() }),
+            quote_of: None
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Reply, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
+    }
+
+    #[test]
+    fn test_simple_quote_chain_1() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: None,
+            quote_of: Some(id1.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: None,
+            quote_of: Some(id2.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: None,
+            quote_of: Some(id3.clone())
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
+    }
+
+    #[test]
+    fn test_simple_quote_chain_2() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: None,
+            quote_of: Some(id1.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: None,
+            quote_of: Some(id3.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: None,
+            quote_of: Some(id2.clone())
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
+    }
+
+    #[test]
+    fn test_simple_quote_chain_3() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: None,
+            quote_of: Some(id2.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: None,
+            quote_of: Some(id1.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: None,
+            quote_of: Some(id3.clone())
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
+    }
+
+    #[test]
+    fn test_simple_quote_chain_4() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: None,
+            quote_of: Some(id2.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: None,
+            quote_of: Some(id3.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: None,
+            quote_of: Some(id1.clone())
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
+    }
+
+    #[test]
+    fn test_simple_quote_chain_5() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: None,
+            quote_of: Some(id3.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: None,
+            quote_of: Some(id1.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: None,
+            quote_of: Some(id2.clone())
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
+    }
+
+    #[test]
+    fn test_simple_quote_chain_6() {
+        let mut uf = BskyPostUnionFind::new();
+
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        uf.ingest_post(BskyPostRecord {
+            id: id4.clone(),
+            reply_to: None,
+            quote_of: Some(id3.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id3.clone(),
+            reply_to: None,
+            quote_of: Some(id2.clone())
+        });
+        uf.ingest_post(BskyPostRecord {
+            id: id2.clone(),
+            reply_to: None,
+            quote_of: Some(id1.clone())
+        });
+
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+
     }
 }
