@@ -1,8 +1,5 @@
 use std::{collections::HashMap, hash::Hash};
 
-// pub mod memory;
-
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct BskyPostId {
     did: String,
@@ -152,7 +149,7 @@ impl<Id: Clone + Eq + Hash> BskyPostUnionFind<Id> {
                     self.union_qo(parent_idx, post_parent_idx);
                 },
                 (Some(parent_parent), None) => {
-                    let parent_root_idx = self.find_qo(*parent_parent);
+                    let parent_root_idx = self.find_qo(*parent_parent).unwrap();
                     self.parents_qo.insert(post_idx, parent_root_idx);
                     self.sizes_qo.entry(parent_root_idx).and_modify(|e| *e += 1);
                 },
@@ -179,29 +176,38 @@ impl<Id: Clone + Eq + Hash> BskyPostUnionFind<Id> {
         true
     }
 
-    // find the representative node for a given index
-    fn find_qo(&mut self, idx: UFIndex) -> UFIndex {
+    fn find(parents: &mut HashMap<UFIndex, UFIndex>, idx: UFIndex) -> Option<UFIndex> {
         let mut curr_idx = idx;
-        let mut pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
+        let mut pa_idx = *parents.get(&curr_idx)?;
         while curr_idx != pa_idx {
             curr_idx = pa_idx;
-            pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
+            pa_idx = *parents.get(&curr_idx).unwrap();
         }
         let rep = curr_idx;
 
         curr_idx = idx;
-        pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
+        pa_idx = *parents.get(&curr_idx).unwrap();
         while curr_idx != pa_idx {
-            self.parents_qo.insert(curr_idx, rep);
+            parents.insert(curr_idx, rep);
             curr_idx = pa_idx;
-            pa_idx = *self.parents_qo.get(&curr_idx).unwrap();
+            pa_idx = *parents.get(&curr_idx).unwrap();
         }
-        curr_idx
+        Some(curr_idx)
     }
 
+    // find the representative node for a given index
+    fn find_qo(&mut self, idx: UFIndex) -> Option<UFIndex> {
+        Self::find(&mut self.parents_qo, idx)
+    }
+
+    fn find_rq(&mut self, idx: UFIndex) -> Option<UFIndex> {
+        Self::find(&mut self.parents_rq, idx)
+    }
+
+
     fn union_qo(&mut self, idx1: UFIndex, idx2: UFIndex) {
-        let pa1 = self.find_qo(idx1);
-        let pa2 = self.find_qo(idx2);
+        let pa1 = self.find_qo(idx1).unwrap();
+        let pa2 = self.find_qo(idx2).unwrap();
 
         if pa1 == pa2 {
             return;
@@ -221,28 +227,9 @@ impl<Id: Clone + Eq + Hash> BskyPostUnionFind<Id> {
         }
     }
 
-    fn find_rq(&mut self, idx: UFIndex) -> UFIndex {
-        let mut curr_idx = idx;
-        let mut pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
-        while curr_idx != pa_idx {
-            curr_idx = pa_idx;
-            pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
-        }
-        let rep = curr_idx;
-
-        curr_idx = idx;
-        pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
-        while curr_idx != pa_idx {
-            self.parents_rq.insert(curr_idx, rep);
-            curr_idx = pa_idx;
-            pa_idx = *self.parents_rq.get(&curr_idx).unwrap();
-        }
-        curr_idx
-    }
-
     fn union_rq(&mut self, idx1: UFIndex, idx2: UFIndex) {
-        let pa1 = self.find_rq(idx1);
-        let pa2 = self.find_rq(idx2);
+        let pa1 = self.find_rq(idx1).unwrap();
+        let pa2 = self.find_rq(idx2).unwrap();
 
         if pa1 == pa2 {
             return;
@@ -267,15 +254,15 @@ impl<Id: Clone + Eq + Hash> BskyPostUnionFind<Id> {
         match subgraph_type {
             SubgraphType::Reply => {
                 // special structure of replies means all non-root nodes are direct children of root
-                let pa = *self.parents_ro.get(&idx).unwrap();
+                let pa = *self.parents_ro.get(&idx)?;
                 self.sizes_ro.get(&pa).map(|idx| *idx)
             },
             SubgraphType::Quote => {
-                let pa = self.find_qo(idx);
+                let pa = self.find_qo(idx)?;
                 self.sizes_qo.get(&pa).map(|idx| *idx)
             },
             SubgraphType::ReplyQuote => {
-                let pa = self.find_rq(idx);
+                let pa = self.find_rq(idx)?;
                 self.sizes_rq.get(&pa).map(|idx| *idx)
             },
         }
@@ -284,9 +271,9 @@ impl<Id: Clone + Eq + Hash> BskyPostUnionFind<Id> {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::SubgraphType;
+    use itertools::Itertools;
 
-    use super::{BskyPostId, BskyPostRecord, BskyPostUnionFind};
+    use super::{BskyPostId, BskyPostRecord, BskyPostReplyTo, BskyPostUnionFind, SubgraphType};
 
     #[test]
     fn test_simple_reply_thread_1() {
@@ -359,212 +346,173 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_quote_chain_1() {
-        let mut uf = BskyPostUnionFind::new();
-
+    fn test_simple_quote_chain() {
         let id1 = BskyPostId::from("a", "1");
         let id2 = BskyPostId::from("b", "1");
         let id3 = BskyPostId::from("a", "2");
         let id4 = BskyPostId::from("a", "3");
-        uf.ingest_post(BskyPostRecord {
-            id: id2.clone(),
-            reply_to: None,
-            quote_of: Some(id1.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id3.clone(),
-            reply_to: None,
-            quote_of: Some(id2.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id4.clone(),
-            reply_to: None,
-            quote_of: Some(id3.clone())
-        });
+        let mut records: Vec<BskyPostRecord<BskyPostId>> = vec![
+            BskyPostRecord {
+                id: id2.clone(),
+                reply_to: None,
+                quote_of: Some(id1.clone())
+            },
+            BskyPostRecord {
+                id: id3.clone(),
+                reply_to: None,
+                quote_of: Some(id2.clone())
+            },
+            BskyPostRecord {
+                id: id4.clone(),
+                reply_to: None,
+                quote_of: Some(id3.clone())
+            }
+        ];
 
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+        for (i, perm) in records.iter().permutations(records.len()).enumerate() {
+            let mut uf = BskyPostUnionFind::new();
+            uf.ingest_post(perm[0].clone());
+            uf.ingest_post(perm[1].clone());
+            uf.ingest_post(perm[2].clone());
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+        }
+
+
 
     }
 
     #[test]
-    fn test_simple_quote_chain_2() {
-        let mut uf = BskyPostUnionFind::new();
-
+    fn test_simple_reply_quote_graph_1() {
         let id1 = BskyPostId::from("a", "1");
         let id2 = BskyPostId::from("b", "1");
         let id3 = BskyPostId::from("a", "2");
         let id4 = BskyPostId::from("a", "3");
-        uf.ingest_post(BskyPostRecord {
-            id: id2.clone(),
-            reply_to: None,
-            quote_of: Some(id1.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id4.clone(),
-            reply_to: None,
-            quote_of: Some(id3.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id3.clone(),
-            reply_to: None,
-            quote_of: Some(id2.clone())
-        });
+        let mut records: Vec<BskyPostRecord<BskyPostId>> = vec![
+            BskyPostRecord {
+                id: id2.clone(),
+                reply_to: Some(BskyPostReplyTo { target: id1.clone(), root: id1.clone() }),
+                quote_of: None
+            },
+            BskyPostRecord {
+                id: id3.clone(),
+                reply_to: Some(BskyPostReplyTo { target: id2.clone(), root: id1.clone() }),
+                quote_of: None
+            },
+            BskyPostRecord {
+                id: id4.clone(),
+                reply_to: None,
+                quote_of: Some(id3.clone())
+            }
+        ];
 
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+        for perm in records.iter().permutations(records.len()) {
+            let mut uf = BskyPostUnionFind::new();
+            uf.ingest_post(perm[0].clone());
+            uf.ingest_post(perm[1].clone());
+            uf.ingest_post(perm[2].clone());
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id1), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id2), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id3), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id4), None);
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+        }
+    }
+
+    #[test]
+    fn test_simple_reply_quote_graph_2() {
+        let id1 = BskyPostId::from("a", "1");
+        let id2 = BskyPostId::from("b", "1");
+        let id3 = BskyPostId::from("a", "2");
+        let id4 = BskyPostId::from("a", "3");
+        let mut records: Vec<BskyPostRecord<BskyPostId>> = vec![
+            BskyPostRecord {
+                id: id2.clone(),
+                reply_to: Some(BskyPostReplyTo { target: id1.clone(), root: id1.clone() }),
+                quote_of: None
+            },
+            BskyPostRecord {
+                id: id4.clone(),
+                reply_to: Some(BskyPostReplyTo { target: id3.clone(), root: id3.clone() }),
+                quote_of: Some(id2.clone())
+            },
+        ];
+
+        for (i, perm) in records.iter().permutations(records.len()).enumerate() {
+            let mut uf = BskyPostUnionFind::new();
+            uf.ingest_post(perm[0].clone());
+            uf.ingest_post(perm[1].clone());
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id1), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id2), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id3), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id4), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id1), None);
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id3), None);
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+        }
 
     }
 
     #[test]
-    fn test_simple_quote_chain_3() {
-        let mut uf = BskyPostUnionFind::new();
-
+    fn test_reply_quote_graph() {
         let id1 = BskyPostId::from("a", "1");
         let id2 = BskyPostId::from("b", "1");
-        let id3 = BskyPostId::from("a", "2");
-        let id4 = BskyPostId::from("a", "3");
-        uf.ingest_post(BskyPostRecord {
-            id: id3.clone(),
-            reply_to: None,
-            quote_of: Some(id2.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id2.clone(),
-            reply_to: None,
-            quote_of: Some(id1.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id4.clone(),
-            reply_to: None,
-            quote_of: Some(id3.clone())
-        });
+        let id3 = BskyPostId::from("c", "1");
+        let id4 = BskyPostId::from("a", "2");
+        let id5 = BskyPostId::from("a", "3");
+        let id6 = BskyPostId::from("a", "4");
+        let mut records: Vec<BskyPostRecord<BskyPostId>> = vec![
+            BskyPostRecord {
+                id: id3.clone(),
+                reply_to: Some(BskyPostReplyTo { target: id2.clone(), root: id1.clone() }),
+                quote_of: None
+            },
+            BskyPostRecord {
+                id: id6.clone(),
+                reply_to: Some(BskyPostReplyTo { target: id5.clone(), root: id4.clone() }),
+                quote_of: Some(id3.clone())
+            },
+        ];
 
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
-
-    }
-
-    #[test]
-    fn test_simple_quote_chain_4() {
-        let mut uf = BskyPostUnionFind::new();
-
-        let id1 = BskyPostId::from("a", "1");
-        let id2 = BskyPostId::from("b", "1");
-        let id3 = BskyPostId::from("a", "2");
-        let id4 = BskyPostId::from("a", "3");
-        uf.ingest_post(BskyPostRecord {
-            id: id3.clone(),
-            reply_to: None,
-            quote_of: Some(id2.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id4.clone(),
-            reply_to: None,
-            quote_of: Some(id3.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id2.clone(),
-            reply_to: None,
-            quote_of: Some(id1.clone())
-        });
-
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
-
-    }
-
-    #[test]
-    fn test_simple_quote_chain_5() {
-        let mut uf = BskyPostUnionFind::new();
-
-        let id1 = BskyPostId::from("a", "1");
-        let id2 = BskyPostId::from("b", "1");
-        let id3 = BskyPostId::from("a", "2");
-        let id4 = BskyPostId::from("a", "3");
-        uf.ingest_post(BskyPostRecord {
-            id: id4.clone(),
-            reply_to: None,
-            quote_of: Some(id3.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id2.clone(),
-            reply_to: None,
-            quote_of: Some(id1.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id3.clone(),
-            reply_to: None,
-            quote_of: Some(id2.clone())
-        });
-
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
-
-    }
-
-    #[test]
-    fn test_simple_quote_chain_6() {
-        let mut uf = BskyPostUnionFind::new();
-
-        let id1 = BskyPostId::from("a", "1");
-        let id2 = BskyPostId::from("b", "1");
-        let id3 = BskyPostId::from("a", "2");
-        let id4 = BskyPostId::from("a", "3");
-        uf.ingest_post(BskyPostRecord {
-            id: id4.clone(),
-            reply_to: None,
-            quote_of: Some(id3.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id3.clone(),
-            reply_to: None,
-            quote_of: Some(id2.clone())
-        });
-        uf.ingest_post(BskyPostRecord {
-            id: id2.clone(),
-            reply_to: None,
-            quote_of: Some(id1.clone())
-        });
-
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::Quote, &id4), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(4));
-        assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(4));
+        for (i, perm) in records.iter().permutations(records.len()).enumerate() {
+            let mut uf = BskyPostUnionFind::new();
+            uf.ingest_post(perm[0].clone());
+            uf.ingest_post(perm[1].clone());
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id1), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id2), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id3), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id4), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id5), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Reply, &id6), Some(3));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id1), None);
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id2), None);
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id3), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id4), None);
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id5), None);
+            assert_eq!(uf.component_size(SubgraphType::Quote, &id6), Some(2));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id1), Some(6));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id2), Some(6));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id3), Some(6));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id4), Some(6));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id5), Some(6));
+            assert_eq!(uf.component_size(SubgraphType::ReplyQuote, &id6), Some(6));
+        }
 
     }
 }
