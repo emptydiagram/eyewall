@@ -1,9 +1,15 @@
 use std::{collections::HashMap, hash::Hash};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct BskyPostId {
+pub struct BskyPostId {
     did: String,
     rkey: String,
+}
+
+impl BskyPostId {
+    pub fn new(did: String, rkey: String) -> BskyPostId {
+        BskyPostId { did: did, rkey: rkey }
+    }
 }
 
 impl BskyPostId {

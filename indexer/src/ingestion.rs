@@ -1,20 +1,97 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
-use log::{error, info};
-use rocketman::{connection::JetstreamConnection, endpoints::JetstreamEndpoints, handler, ingestion::LexiconIngestor, options::JetstreamOptions, types::event::Event};
+use log::{debug, error, info};
+use rocketman::{connection::JetstreamConnection, endpoints::JetstreamEndpoints, handler, ingestion::LexiconIngestor, options::JetstreamOptions, types::event::{Event, Kind}};
 use serde_json::Value;
 use tokio::{select, sync::Notify, time::{self, Duration}};
 
+use crate::storage;
+
 static BSKY_POST_NSID: &'static str = "app.bsky.feed.post";
+static BSKY_EMBED_RECORD_NSID: &'static str = "app.bsky.embed.record";
 
 struct PostIngestor;
 
 #[async_trait]
 impl LexiconIngestor for PostIngestor {
     async fn ingest(&self, message: Event<Value>) ->  Result<()> {
-        info!("{:?}", message);
+        if message.commit.is_none() {
+            return Ok(());
+        }
+        let commit = message.commit.as_ref().unwrap();
+        if commit.record.is_none() {
+            return Ok(());
+        }
+        let record = commit.record.as_ref().unwrap();
+
+        match record {
+            Value::Object(map) => {
+                let reply = map.get("reply");
+                let has_reply = reply.is_some();
+
+                let mut embed_record = None;
+                if let Some(Value::Object(embed_map)) = map.get("embed") {
+                    if let Some(Value::String(ty)) = embed_map.get("$type") {
+                        if ty == BSKY_EMBED_RECORD_NSID {
+                            embed_record = embed_map.get("record");
+                        }
+                    }
+                }
+                let has_quote = embed_record.is_none();
+
+                if !has_reply && !has_quote {
+                    return Ok(());
+                }
+
+                debug!("{:?}", message);
+
+                let post_id = storage::BskyPostId::new(message.did, message.commit.unwrap().rkey);
+
+                // if let Some(Value::Object(embed_record)) = embed_map.get("record") {
+                //     if let Some(uri) = embed_record.get("uri") {
+                //     }
+                // }
+
+            },
+            _ => {
+                return Ok(());
+            }
+        }
+
+        // Event { did: "did:plc:i5o7ybb4yg45zhnhigrzeiqn", time_us: Some(1746977528899856), kind: Commit, commit: Some(Commit {
+        //   rev: "3lovrnkjkf32t", operation: Create, collection: "app.bsky.feed.post", rkey: "3lovrnkbesk2z",
+        //   record: Some(Object {
+        //      "$type": String("app.bsky.feed.post"), "createdAt": String("2025-05-11T15:32:08.458Z"), "langs": Array [String("en")],
+        //      "reply": Object {
+        //          "parent": Object {
+        //              "cid": String("bafyreifhgwuhg25cdh7r4xg54c7zyt3miq37caeixkfdwlpsxbsucdedey"), "uri": String("at://did:plc:qsmmhv4u2ygx2thvepti77zc/app.bsky.feed.post/3lovq4eaoxc2y")
+        //          },
+        //          "root": Object {
+        //              "cid": String("bafyreifhgwuhg25cdh7r4xg54c7zyt3miq37caeixkfdwlpsxbsucdedey"), "uri": String("at://did:plc:qsmmhv4u2ygx2thvepti77zc/app.bsky.feed.post/3lovq4eaoxc2y")
+        //          }
+        //      }, "text": String("Military security is a concept of the past for Trump. Anything and everything is for sale.")}), cid: Some("bafyreicf5n2zehmldcvn6twlmoadq6awsdbofhizq2saxstdik5d4yvckm") }),
+        // identity: None }
+
+
+        /*
+         *
+         * Event {
+         *  did: "did:plc:qinfhaxhsd3kwga35ldgc4zu", time_us: Some(1746985087246643), kind: Commit,
+         *  commit: Some(Commit {
+         *      rev: "3lovyosmtu32v", operation: Create, collection: "app.bsky.feed.post", rkey: "3lovyosgpvc2t",
+         *      record: Some(Object {
+         *          "$type": String("app.bsky.feed.post"), "createdAt": String("2025-05-11T17:38:06.770Z"),
+         *          "embed": Object {
+         *              "$type": String("app.bsky.embed.record"),
+         *              "record": Object {
+         *                   "cid": String("bafyreifpwkwnmcrkmvjhp6kbpzmxe3cpua4dcjwcfpsqz4bkxjiypj2fn4"), "uri": String("at://did:plc:ib6pplehueaytqk3q7kpllwh/app.bsky.feed.post/3lovugh5g4s2s")
+         *              }
+         *          }, "langs": Array [String("en")], "text": String("I am old enough to remember when Jimmie Carter gave up his beloved peanut farm voluntarily even before anyone complained, simply to not risk any accidental infraction of the Emoluments clause")}), cid: Some("bafyreih52kyfdiagt3lzrl5ekg5ulc632624hws4xanndhsbzne7yoxfhm") }), identity: None }
+         */
+
+
         Ok(())
     }
 }
@@ -41,7 +118,7 @@ async fn persist_cursor_task(cursor: Arc<Mutex<Option<u64>>>, shutdown: Arc<Noti
 }
 
 
-pub async fn consume() -> Result<()> {
+pub async fn consume(cursor_val: Option<u64>) -> Result<()> {
     let opts = JetstreamOptions::builder()
         .wanted_collections(vec![BSKY_POST_NSID.to_string()])
         .ws_url(JetstreamEndpoints::Public(rocketman::endpoints::JetstreamEndpointLocations::UsEast, 2))
@@ -55,7 +132,7 @@ pub async fn consume() -> Result<()> {
         Box::new(PostIngestor)
     );
 
-    let cursor = Arc::new(Mutex::new(None));
+    let cursor = Arc::new(Mutex::new(cursor_val));
 
     let shutdown = Arc::new(Notify::new());
     let persist_handle = {
@@ -72,19 +149,15 @@ pub async fn consume() -> Result<()> {
             let handle_result = handler::handle_message(msg, &ingestors, reconnect_tx.clone(), c_cursor.clone()).await;
             if let Err(e) = handle_result{
                 error!("Error processing message: {}", e);
-            };
+            }
         }
         anyhow::Ok(())
     });
-
-    info!("About to connect");
 
     if let Err(e) = js_conn.connect(cursor.clone()).await {
         error!("Error connecting: {}", e);
         std::process::exit(1);
     }
-
-    info!("After connect");
 
     select! {
         _ = tokio::signal::ctrl_c() => info!("ctrl-c"),
