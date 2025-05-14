@@ -2,31 +2,31 @@ use std::{collections::HashMap, sync::{Arc, Mutex}};
 
 use anyhow::{Result};
 use async_trait::async_trait;
-use log::{debug, error, info};
+use log::{error, info};
 use rocketman::{connection::JetstreamConnection, endpoints::JetstreamEndpoints, handler, ingestion::LexiconIngestor, options::JetstreamOptions, types::event::{Event, Kind}};
 use serde_json::Value;
 use tokio::{select, sync::Notify, time::{self, Duration}};
 
 use crate::storage::{self, BskyPostRecord};
+use crate::storage::db::DbPool;
 
 static BSKY_POST_NSID: &'static str = "app.bsky.feed.post";
 static BSKY_EMBED_RECORD_NSID: &'static str = "app.bsky.embed.record";
 
 
+
 struct PostIngestor {
-    pool: storage::db::DbPool
+    pool: DbPool
 }
 
 impl PostIngestor {
-    async fn new() -> Result<PostIngestor> {
-        let pool = storage::db::connect().await?;
-        Ok(PostIngestor { pool })
+    fn new(pool: DbPool) -> PostIngestor {
+        PostIngestor { pool }
     }
 }
 
 #[async_trait]
 impl LexiconIngestor for PostIngestor {
-
     async fn ingest(&self, message: Event<Value>) ->  Result<()> {
         if message.commit.is_none() {
             return Ok(());
@@ -56,7 +56,7 @@ impl LexiconIngestor for PostIngestor {
                     return Ok(());
                 }
 
-                debug!("{:?}", message);
+                // debug!("{:?}", message);
 
                 let post_id = storage::BskyPostId::new(&message.did[..], &commit.rkey[..]);
 
@@ -137,29 +137,32 @@ impl LexiconIngestor for PostIngestor {
     }
 }
 
-async fn persist_cursor_task(cursor: Arc<Mutex<Option<u64>>>, shutdown: Arc<Notify>, interval: Duration) {
+async fn persist_cursor_task(cursor: Arc<Mutex<Option<u64>>>, pool: DbPool, shutdown: Arc<Notify>, interval: Duration) {
     let mut ticker = time::interval(interval);
 
     loop {
         select! {
             _ = ticker.tick() => {
-                if let Some(c) = *cursor.lock().unwrap() {
-                    println!("cursor = {c}");
+                let maybe_c = (*cursor.lock().unwrap()).map(|c| c);
+                if let Some(c) = maybe_c {
+                    info!("cursor = {c}");
+                    let _ = storage::db::update_cursor(&pool, c).await;
                 }
             }
             _ = shutdown.notified() => {
-                if let Some(c) = *cursor.lock().unwrap() {
-                    println!("final cursor = {c}");
+                let maybe_c = (*cursor.lock().unwrap()).map(|c| c);
+                if let Some(c) = maybe_c {
+                    info!("final cursor = {c}");
+                    let _ = storage::db::update_cursor(&pool, c).await;
                 }
                 break;
             }
         }
     }
-
 }
 
 
-pub async fn consume(cursor_val: Option<u64>) -> Result<()> {
+pub async fn consume() -> Result<()> {
     let opts = JetstreamOptions::builder()
         .wanted_collections(vec![BSKY_POST_NSID.to_string()])
         .ws_url(JetstreamEndpoints::Public(rocketman::endpoints::JetstreamEndpointLocations::UsEast, 2))
@@ -167,11 +170,16 @@ pub async fn consume(cursor_val: Option<u64>) -> Result<()> {
 
     let js_conn = JetstreamConnection::new(opts);
 
+    let pool = storage::db::connect().await?;
+
     let mut ingestors: HashMap<String, Box<dyn LexiconIngestor + Send + Sync>> = HashMap::new();
     ingestors.insert(
         BSKY_POST_NSID.to_string(),
-        Box::new(PostIngestor::new().await.expect("Could not connect to DB"))
+        Box::new(PostIngestor::new(pool.clone()))
     );
+
+    let cursor_val = storage::db::read_bsky_post_cursor(&pool).await.ok();
+    info!("Initial cursor = {:?}", cursor_val);
 
     let cursor = Arc::new(Mutex::new(cursor_val));
 
@@ -179,7 +187,7 @@ pub async fn consume(cursor_val: Option<u64>) -> Result<()> {
     let persist_handle = {
         let c = cursor.clone();
         let s = shutdown.clone();
-        tokio::spawn(persist_cursor_task(c, s, Duration::from_millis(500)))
+        tokio::spawn(persist_cursor_task(c, pool.clone(), s, Duration::from_millis(500)))
     };
 
     let msg_rx = js_conn.get_msg_rx();

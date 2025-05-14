@@ -1,6 +1,6 @@
 use std::env;
 
-use sqlx::{postgres::{PgPoolOptions, PgRow}, Pool, Postgres, Row};
+use sqlx::{postgres::PgPoolOptions, types::chrono::NaiveDateTime, Pool, Postgres, Row};
 
 use super::{BskyPostId, BskyPostRecord};
 
@@ -77,4 +77,22 @@ pub async fn insert_bsky_post<S: AsRef<str>>(pool: &DbPool, post: BskyPostRecord
             .await?;
     }
     Ok(())
+}
+
+pub async fn read_bsky_post_cursor(pool: &DbPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("SELECT bsky_post_cursor FROM eyewall.ingest_state WHERE id = 1")
+        .fetch_one(pool)
+        .await?;
+    let cursor: NaiveDateTime = result.try_get("bsky_post_cursor")?;
+    Ok(cursor.and_utc().timestamp_micros() as u64)
+}
+
+pub async fn update_cursor(pool: &DbPool, cursor_val: u64) -> Result<(), sqlx::Error> {
+    let cursor_val_conv = (cursor_val as f64) / 1e6;
+    sqlx::query("UPDATE ingest_state SET bsky_post_cursor = to_timestamp($1) where id = 1")
+        .bind(cursor_val_conv)
+        .execute(pool)
+        .await?;
+    Ok(())
+
 }
