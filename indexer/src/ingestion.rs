@@ -1,21 +1,32 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}};
 
-use anyhow::{bail, Result};
+use anyhow::{Result};
 use async_trait::async_trait;
 use log::{debug, error, info};
 use rocketman::{connection::JetstreamConnection, endpoints::JetstreamEndpoints, handler, ingestion::LexiconIngestor, options::JetstreamOptions, types::event::{Event, Kind}};
 use serde_json::Value;
 use tokio::{select, sync::Notify, time::{self, Duration}};
 
-use crate::storage;
+use crate::storage::{self, BskyPostRecord};
 
 static BSKY_POST_NSID: &'static str = "app.bsky.feed.post";
 static BSKY_EMBED_RECORD_NSID: &'static str = "app.bsky.embed.record";
 
-struct PostIngestor;
+
+struct PostIngestor {
+    pool: storage::db::DbPool
+}
+
+impl PostIngestor {
+    async fn new() -> Result<PostIngestor> {
+        let pool = storage::db::connect().await?;
+        Ok(PostIngestor { pool })
+    }
+}
 
 #[async_trait]
 impl LexiconIngestor for PostIngestor {
+
     async fn ingest(&self, message: Event<Value>) ->  Result<()> {
         if message.commit.is_none() {
             return Ok(());
@@ -47,12 +58,39 @@ impl LexiconIngestor for PostIngestor {
 
                 debug!("{:?}", message);
 
-                let post_id = storage::BskyPostId::new(message.did, message.commit.unwrap().rkey);
+                let post_id = storage::BskyPostId::new(&message.did[..], &commit.rkey[..]);
 
-                // if let Some(Value::Object(embed_record)) = embed_map.get("record") {
-                //     if let Some(uri) = embed_record.get("uri") {
-                //     }
-                // }
+                let reply_to = reply.map(|val| {
+                    if let Value::Object(map) = val {
+                        if let Some(Value::Object(parent_map)) = map.get("parent") {
+                            if let Some(Value::String(parent_uri)) = parent_map.get("uri") {
+                                let parts: Vec<_> = parent_uri.split('/').collect();
+                                let parent_id = storage::BskyPostId::new(parts[2], parts[4]);
+                                if let Some(Value::Object(root_map)) = map.get("root") {
+                                    if let Some(Value::String(root_uri)) = root_map.get("uri") {
+                                        let parts: Vec<_> = root_uri.split('/').collect();
+                                        let root_id = storage::BskyPostId::new(parts[2], parts[4]);
+                                        return storage::BskyPostReplyTo::new(parent_id, root_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    panic!("Expected reply to be object");
+                });
+
+                let mut quote_of = None;
+                if let Some(Value::Object(embed_record)) = embed_record {
+                    if let Some(Value::String(uri)) = embed_record.get("uri") {
+                        let parts: Vec<_> = uri.split('/').collect();
+                        let author_did = parts[2];
+                        let rkey = parts[4];
+                        quote_of = Some(storage::BskyPostId::new(author_did, rkey));
+                    }
+                }
+
+                let post = BskyPostRecord::new(post_id, reply_to, quote_of, message.time_us);
+                storage::db::insert_bsky_post(&self.pool, post).await?;
 
             },
             _ => {
@@ -60,13 +98,16 @@ impl LexiconIngestor for PostIngestor {
             }
         }
 
-        // Event { did: "did:plc:i5o7ybb4yg45zhnhigrzeiqn", time_us: Some(1746977528899856), kind: Commit, commit: Some(Commit {
-        //   rev: "3lovrnkjkf32t", operation: Create, collection: "app.bsky.feed.post", rkey: "3lovrnkbesk2z",
+        // Event {
+        //   did: "did:plc:i5o7ybb4yg45zhnhigrzeiqn", time_us: Some(1746977528899856), kind: Commit, commit: Some(Commit {
+        //   rev: "3lovrnkjkf32t", operation: Create, collection: "app.bsky.feed.post",
+        //   rkey: "3lovrnkbesk2z",
         //   record: Some(Object {
         //      "$type": String("app.bsky.feed.post"), "createdAt": String("2025-05-11T15:32:08.458Z"), "langs": Array [String("en")],
         //      "reply": Object {
         //          "parent": Object {
-        //              "cid": String("bafyreifhgwuhg25cdh7r4xg54c7zyt3miq37caeixkfdwlpsxbsucdedey"), "uri": String("at://did:plc:qsmmhv4u2ygx2thvepti77zc/app.bsky.feed.post/3lovq4eaoxc2y")
+        //              "cid": String("bafyreifhgwuhg25cdh7r4xg54c7zyt3miq37caeixkfdwlpsxbsucdedey"),
+        //              "uri": String("at://did:plc:qsmmhv4u2ygx2thvepti77zc/app.bsky.feed.post/3lovq4eaoxc2y")
         //          },
         //          "root": Object {
         //              "cid": String("bafyreifhgwuhg25cdh7r4xg54c7zyt3miq37caeixkfdwlpsxbsucdedey"), "uri": String("at://did:plc:qsmmhv4u2ygx2thvepti77zc/app.bsky.feed.post/3lovq4eaoxc2y")
@@ -129,7 +170,7 @@ pub async fn consume(cursor_val: Option<u64>) -> Result<()> {
     let mut ingestors: HashMap<String, Box<dyn LexiconIngestor + Send + Sync>> = HashMap::new();
     ingestors.insert(
         BSKY_POST_NSID.to_string(),
-        Box::new(PostIngestor)
+        Box::new(PostIngestor::new().await.expect("Could not connect to DB"))
     );
 
     let cursor = Arc::new(Mutex::new(cursor_val));
